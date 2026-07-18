@@ -17,7 +17,7 @@ You can choose to either download a pre-compiled version or compile the utility 
 
 ### Option A: Download Pre-compiled Packages
 You do not need to compile the code manually. You can download the standalone executable immediately:
-1. Go to the **Releases / Packages** section on this repository page.
+1. Go to the **Release** section on this repository page.
 2. Download the latest `UltimateAutoClicker.exe` file.
 3. Place it anywhere on your computer and run it. No installation is required.
 
