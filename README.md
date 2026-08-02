@@ -60,10 +60,11 @@ Configuring and controlling your automated clicks is managed through a clean, in
    * Choose **Current Location** to click wherever your mouse pointer is currently resting.
    * Choose **Specific Location** to target static coordinates. You can manually enter **X** and **Y** coordinates, or click **Pick Location** to hide the window and capture coordinates automatically on your next click.
 
-### Setting up the Hotkey
-To avoid confusion, configuring a global hotkey is split into a simple two-step process:
-1. Click the box under **1. Press keys:** and press your desired key combination on your keyboard (e.g., `F6`, `Ctrl + Shift + Q`, or `Alt + Z`).
-2. Click **2. Apply Hotkey** to register it. You will receive a confirmation message, and your new hotkey will automatically display inside the main **START CLICKING** button for quick reference.
+### Setting up Custom Hotkeys
+Configuring your global hotkey is managed via a dedicated modal dialog supporting custom multi-key combinations:
+1. Click the **Change Hotkey...** button (this automatically stops active clicking if running).
+2. An **Assign Hotkey** popup window will appear with a live key recorder. Press any key combination on your keyboard (e.g., `X + Z`, `F6 + F7`, `Ctrl + Shift + Q`, `F6`, or `Space + Enter`).
+3. Click **Save Hotkey** to apply your new key combination, or click **Cancel** to discard changes and revert to your previous hotkey.
 
 <hr>
 
@@ -73,8 +74,9 @@ Ultimate AutoClicker is designed with several low-level optimizations to ensure 
 
 * <span style="color:#2980b9"><b>Event-Driven Efficiency:</b></span> Unlike typical clickers that constantly run CPU-intensive polling loops in the background, this program uses Windows `Event` handles and kernel waitable timers. When clicking is inactive, the background thread is completely asleep, consuming zero processor resources.
 * <span style="color:#27ae60"><b>Sub-Millisecond Microsecond Precision:</b></span> Supports microsecond timing ($\mu\text{s}$) powered by `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` and `NtSetTimerResolution`, enabling ultra-fast sub-1ms clicking without locking up CPU cores or freezing the desktop cursor.
-* <span style="color:#16a085"><b>Enter-Key Smart Conversion:</b></span> Type any value or decimal into any interval box and press **Enter** to instantly convert and format values across unit fields.
-* <span style="color:#e67e22"><b>Instant Stop Response:</b></span> If you set a long interval (e.g., 10 seconds) and need to stop clicking immediately, pressing the stop hotkey triggers a thread interrupt. It will stop instantly without waiting for the remainder of the sleep interval to finish.
+* <span style="color:#16a085"><b>Custom Multi-Key Hotkeys:</b></span> Powered by a low-latency keyboard hook (`WH_KEYBOARD_LL`), allowing unconventional hotkey combinations like `X + Z` or `F6 + F7` alongside standard shortcuts.
+* <span style="color:#e67e22"><b>Enter-Key Smart Conversion:</b></span> Type any value or decimal into any interval box and press **Enter** to instantly convert and format values across unit fields.
+* <span style="color:#d35400"><b>Instant Stop Response:</b></span> If you set a long interval (e.g., 10 seconds) and need to stop clicking immediately, pressing the stop hotkey triggers a thread interrupt. It will stop instantly without waiting for the remainder of the sleep interval to finish.
 * <span style="color:#8e44ad"><b>Always on Top:</b></span> Checking the **Always on Top** box floats the interface over other windows, ensuring you always have quick visual access to the controls while running other full-screen or windowed programs.
 
 ---

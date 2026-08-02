@@ -16,7 +16,7 @@ enum {
     ID_BTN_COMBO, ID_TYPE_COMBO,
     ID_REP_INF, ID_REP_TIMES, ID_REP_COUNT,
     ID_POS_CUR, ID_POS_CUST, ID_POS_X, ID_POS_Y, ID_PICK_BTN,
-    ID_HOTKEY_CTRL, ID_SET_HOTKEY,
+    ID_HOTKEY_LABEL, ID_CHANGE_HOTKEY_BTN,
     ID_TOP_CHECK, ID_MAIN_BTN
 };
 
@@ -37,7 +37,8 @@ typedef NTSTATUS (NTAPI *pfnNtSetTimerResolution)(ULONG DesiredResolution, BOOLE
 typedef MMRESULT (WINAPI *pfnTimeBeginPeriod)(UINT);
 typedef MMRESULT (WINAPI *pfnTimeEndPeriod)(UINT);
 
-// Store the readable name of the hotkey so we can show it on the button
+// Hotkey State
+WORD currentHkVal = MAKEWORD(VK_F6, 0); // Default F6
 char currentHotkeyName[64] = "F6";
 
 HWND hMainWnd;
@@ -45,6 +46,28 @@ HHOOK hMouseHook = NULL;
 HFONT hFont = NULL, hBold = NULL;
 
 HANDLE hClickEvent = NULL;
+
+// Helper to format hotkey key combinations into readable text
+void FormatHotkeyName(WORD hkVal, char* outBuffer, size_t bufSize) {
+    UINT vkey = LOBYTE(hkVal);
+    UINT mods = HIBYTE(hkVal);
+    
+    outBuffer[0] = '\0';
+    if (mods & HOTKEYF_CONTROL) lstrcatA(outBuffer, "Ctrl + ");
+    if (mods & HOTKEYF_SHIFT)   lstrcatA(outBuffer, "Shift + ");
+    if (mods & HOTKEYF_ALT)     lstrcatA(outBuffer, "Alt + ");
+
+    char keyName[32] = {0};
+    LONG scanCode = MapVirtualKeyA(vkey, MAPVK_VK_TO_VSC) << 16;
+    switch (vkey) {
+        case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
+        case VK_PRIOR: case VK_NEXT: case VK_END: case VK_HOME:
+        case VK_INSERT: case VK_DELETE: case VK_DIVIDE: case VK_NUMLOCK:
+            scanCode |= 0x01000000; break;
+    }
+    GetKeyNameTextA(scanCode, keyName, sizeof(keyName));
+    lstrcatA(outBuffer, keyName);
+}
 
 LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && wParam == WM_LBUTTONDOWN) {
@@ -78,14 +101,12 @@ void ConvertAndSaveInterval(HWND hwnd) {
     double ms = GetEditDouble(hwnd, ID_MS);
     double us = GetEditDouble(hwnd, ID_US);
 
-    // Compute total microseconds
     double totalUsD = (us) + (ms * 1000.0) + (s * 1000000.0) + (m * 60000000.0) + (h * 3600000000.0);
     if (totalUsD < 0) totalUsD = 0;
 
     long long totalUs = (long long)(totalUsD + 0.5);
     intervalUs = totalUs;
 
-    // Convert across units
     long long outH  = totalUs / 3600000000LL;
     long long rem1  = totalUs % 3600000000LL;
 
@@ -104,7 +125,6 @@ void ConvertAndSaveInterval(HWND hwnd) {
     SetDlgItemInt(hwnd, ID_MS,   (UINT)outMs, FALSE);
     SetDlgItemInt(hwnd, ID_US,   (UINT)outUs, FALSE);
 
-    // Update red warning label
     if (intervalUs < 5000) {
         SetDlgItemTextA(hwnd, ID_WARN_STATIC, "[!] Warning: Interval is below 5 ms (< 200 CPS). Target app may lag.");
     } else {
@@ -118,27 +138,108 @@ void ConvertAndSaveInterval(HWND hwnd) {
 LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     switch (uMsg) {
         case WM_GETDLGCODE:
-            if (wParam == VK_RETURN) {
-                return DLGC_WANTALLKEYS;
-            }
+            if (wParam == VK_RETURN) return DLGC_WANTALLKEYS;
             break;
         case WM_KEYDOWN:
             if (wParam == VK_RETURN) {
                 HWND hMain = (HWND)dwRefData;
                 ConvertAndSaveInterval(hMain);
-                return 0; // Handled
+                return 0;
             }
             break;
         case WM_CHAR:
-            if (wParam == VK_RETURN) {
-                return 0; // Suppress beep sound
-            }
+            if (wParam == VK_RETURN) return 0; // Suppress beep
             break;
         case WM_NCDESTROY:
             RemoveWindowSubclass(hWnd, EditSubclassProc, uIdSubclass);
             break;
     }
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+// Modal Dialog Procedure for Changing Hotkey
+LRESULT CALLBACK HotkeyModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            HFONT f = CreateFontA(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, "Segoe UI");
+            HFONT fBold = CreateFontA(15, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, "Segoe UI");
+
+            HWND hText = CreateWindowExA(0, "STATIC", "Press keys on your keyboard:", WS_VISIBLE | WS_CHILD, 15, 15, 270, 20, hwnd, NULL, NULL, NULL);
+            SendMessage(hText, WM_SETFONT, (WPARAM)f, TRUE);
+
+            HWND hHkCtrl = CreateWindowExA(0, HOTKEY_CLASSA, NULL, WS_VISIBLE | WS_CHILD | WS_BORDER | WS_TABSTOP, 15, 40, 275, 28, hwnd, (HMENU)301, NULL, NULL);
+            SendMessage(hHkCtrl, WM_SETFONT, (WPARAM)fBold, TRUE);
+            SendMessage(hHkCtrl, HKM_SETHOTKEY, currentHkVal, 0);
+            SendMessage(hHkCtrl, HKM_SETRULES, HKCOMB_NONE, 0);
+
+            HWND hBtnSave = CreateWindowExA(0, "BUTTON", "Save Hotkey", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 50, 85, 110, 30, hwnd, (HMENU)IDOK, NULL, NULL);
+            SendMessage(hBtnSave, WM_SETFONT, (WPARAM)fBold, TRUE);
+
+            HWND hBtnCancel = CreateWindowExA(0, "BUTTON", "Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, 170, 85, 120, 30, hwnd, (HMENU)IDCANCEL, NULL, NULL);
+            SendMessage(hBtnCancel, WM_SETFONT, (WPARAM)f, TRUE);
+
+            SetFocus(hHkCtrl);
+            break;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            if (id == IDOK) {
+                HWND hHkCtrl = GetDlgItem(hwnd, 301);
+                LRESULT hk = SendMessage(hHkCtrl, HKM_GETHOTKEY, 0, 0);
+                UINT vkey = LOBYTE(hk), mods = HIBYTE(hk), regMods = 0;
+
+                if (mods & HOTKEYF_ALT) regMods |= MOD_ALT;
+                if (mods & HOTKEYF_CONTROL) regMods |= MOD_CONTROL;
+                if (mods & HOTKEYF_SHIFT) regMods |= MOD_SHIFT;
+
+                if (vkey != 0) {
+                    UnregisterHotKey(hMainWnd, 1);
+                    if (RegisterHotKey(hMainWnd, 1, regMods, vkey)) {
+                        currentHkVal = (WORD)hk;
+                        FormatHotkeyName(currentHkVal, currentHotkeyName, sizeof(currentHotkeyName));
+
+                        char lblBuf[128], btnText[128];
+                        wsprintfA(lblBuf, "Current Hotkey: %s", currentHotkeyName);
+                        SetDlgItemTextA(hMainWnd, ID_HOTKEY_LABEL, lblBuf);
+
+                        wsprintfA(btnText, clicking ? "STOP CLICKING (%s)" : "START CLICKING (%s)", currentHotkeyName);
+                        SetWindowTextA(GetDlgItem(hMainWnd, ID_MAIN_BTN), btnText);
+
+                        EnableWindow(hMainWnd, TRUE);
+                        SetForegroundWindow(hMainWnd);
+                        DestroyWindow(hwnd);
+                    } else {
+                        // Re-register previous hotkey on error
+                        UINT prevVk = LOBYTE(currentHkVal), prevMods = HIBYTE(currentHkVal), prevReg = 0;
+                        if (prevMods & HOTKEYF_ALT) prevReg |= MOD_ALT;
+                        if (prevMods & HOTKEYF_CONTROL) prevReg |= MOD_CONTROL;
+                        if (prevMods & HOTKEYF_SHIFT) prevReg |= MOD_SHIFT;
+                        RegisterHotKey(hMainWnd, 1, prevReg, prevVk);
+
+                        MessageBoxA(hwnd, "Failed to register hotkey. It might be in use by another application.", "Hotkey In Use", MB_ICONERROR);
+                    }
+                }
+            }
+            if (id == IDCANCEL) {
+                EnableWindow(hMainWnd, TRUE);
+                SetForegroundWindow(hMainWnd);
+                DestroyWindow(hwnd);
+            }
+            break;
+        }
+        case WM_CLOSE: {
+            EnableWindow(hMainWnd, TRUE);
+            SetForegroundWindow(hMainWnd);
+            DestroyWindow(hwnd);
+            break;
+        }
+        case WM_CTLCOLORSTATIC: {
+            SetBkMode((HDC)wParam, TRANSPARENT);
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        default: return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    return 0;
 }
 
 // Ultra-optimized, zero-lag sub-millisecond timer delay routine
@@ -216,11 +317,20 @@ DWORD WINAPI ClickerThread(LPVOID lpParam) {
     return 0;
 }
 
-void ToggleClicking() {
-    char btnText[128];
+// Safely stop the auto-clicker
+void StopClicking() {
+    if (clicking) {
+        clicking = false;
+        char btnText[128];
+        wsprintfA(btnText, "START CLICKING (%s)", currentHotkeyName);
+        SetWindowTextA(GetDlgItem(hMainWnd, ID_MAIN_BTN), btnText);
+        ResetEvent(hClickEvent);
+        SetEvent(hClickEvent);
+    }
+}
 
+void ToggleClicking() {
     if (!clicking) {
-        // Ensure values are saved/converted when starting
         ConvertAndSaveInterval(hMainWnd);
 
         clicking = true;
@@ -238,15 +348,12 @@ void ToggleClicking() {
             targetY = GetDlgItemInt(hMainWnd, ID_POS_Y, 0, 1);
         }
 
+        char btnText[128];
         wsprintfA(btnText, "STOP CLICKING (%s)", currentHotkeyName);
         SetWindowTextA(GetDlgItem(hMainWnd, ID_MAIN_BTN), btnText);
         SetEvent(hClickEvent); 
     } else {
-        clicking = false;
-        wsprintfA(btnText, "START CLICKING (%s)", currentHotkeyName);
-        SetWindowTextA(GetDlgItem(hMainWnd, ID_MAIN_BTN), btnText);
-        ResetEvent(hClickEvent);
-        SetEvent(hClickEvent); 
+        StopClicking();
     }
 }
 
@@ -309,10 +416,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessage(hPos1, BM_SETCHECK, BST_CHECKED, 0);
 
             AddCtrl("BUTTON", "Start / Stop Hotkey", BS_GROUPBOX, 10, 338, 365, 65, 0);
-            AddCtrl("STATIC", "1. Press keys:", 0, 25, 368, 90, 20, 0);
-            HWND hHotkey = AddCtrl(HOTKEY_CLASSA, NULL, WS_BORDER | WS_TABSTOP, 115, 365, 110, 24, ID_HOTKEY_CTRL);
-            SendMessage(hHotkey, HKM_SETHOTKEY, VK_F6, 0);
-            AddCtrl("BUTTON", "2. Apply Hotkey", BS_PUSHBUTTON | WS_TABSTOP, 235, 364, 120, 26, ID_SET_HOTKEY);
+            AddCtrl("STATIC", "Current Hotkey: F6", 0, 25, 362, 180, 20, ID_HOTKEY_LABEL, hBold);
+            AddCtrl("BUTTON", "Change Hotkey...", BS_PUSHBUTTON | WS_TABSTOP, 215, 357, 145, 28, ID_CHANGE_HOTKEY_BTN);
 
             AddCtrl("BUTTON", "Always on Top", BS_AUTOCHECKBOX | WS_TABSTOP, 15, 415, 120, 20, ID_TOP_CHECK);
             
@@ -321,7 +426,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RegisterHotKey(hwnd, 1, 0, VK_F6);
             break;
         }
-        case WM_HOTKEY: if (wParam == 1) ToggleClicking(); break;
+        case WM_HOTKEY: {
+            // Ignore hotkeys while modal dialog is open / main window is disabled
+            if (wParam == 1 && IsWindowEnabled(hwnd)) {
+                ToggleClicking();
+            }
+            break;
+        }
         case WM_USER + 1: ToggleClicking(); break; 
         
         case WM_USER + 2: {
@@ -346,46 +457,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool isTop = SendMessage((HWND)lParam, BM_GETCHECK, 0, 0);
                 SetWindowPos(hwnd, isTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             }
-            if (id == ID_SET_HOTKEY) {
-                LRESULT hk = SendMessage(GetDlgItem(hwnd, ID_HOTKEY_CTRL), HKM_GETHOTKEY, 0, 0);
-                UINT vkey = LOBYTE(hk), mods = HIBYTE(hk), regMods = 0;
-                
-                if (mods & HOTKEYF_ALT) regMods |= MOD_ALT;
-                if (mods & HOTKEYF_CONTROL) regMods |= MOD_CONTROL;
-                if (mods & HOTKEYF_SHIFT) regMods |= MOD_SHIFT;
+            if (id == ID_CHANGE_HOTKEY_BTN) {
+                StopClicking(); // Automatically disable the autoclicker if running!
 
-                if (vkey != 0) {
-                    UnregisterHotKey(hwnd, 1);
-                    if (RegisterHotKey(hwnd, 1, regMods, vkey)) {
-                        
-                        currentHotkeyName[0] = '\0';
-                        if (mods & HOTKEYF_CONTROL) lstrcatA(currentHotkeyName, "Ctrl + ");
-                        if (mods & HOTKEYF_SHIFT) lstrcatA(currentHotkeyName, "Shift + ");
-                        if (mods & HOTKEYF_ALT) lstrcatA(currentHotkeyName, "Alt + ");
-                        
-                        char keyName[32] = {0};
-                        LONG scanCode = MapVirtualKeyA(vkey, MAPVK_VK_TO_VSC) << 16;
-                        switch (vkey) {
-                            case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
-                            case VK_PRIOR: case VK_NEXT: case VK_END: case VK_HOME:
-                            case VK_INSERT: case VK_DELETE: case VK_DIVIDE: case VK_NUMLOCK:
-                                scanCode |= 0x01000000; break;
-                        }
-                        GetKeyNameTextA(scanCode, keyName, sizeof(keyName));
-                        lstrcatA(currentHotkeyName, keyName);
+                EnableWindow(hwnd, FALSE);
 
-                        char btnText[128];
-                        wsprintfA(btnText, clicking ? "STOP CLICKING (%s)" : "START CLICKING (%s)", currentHotkeyName);
-                        SetWindowTextA(GetDlgItem(hwnd, ID_MAIN_BTN), btnText);
+                RECT rcMain;
+                GetWindowRect(hwnd, &rcMain);
+                int modalW = 310, modalH = 165;
+                int modalX = rcMain.left + (rcMain.right - rcMain.left - modalW) / 2;
+                int modalY = rcMain.top + (rcMain.bottom - rcMain.top - modalH) / 2;
 
-                        char successMsg[128];
-                        wsprintfA(successMsg, "Hotkey successfully changed to:\n\n%s", currentHotkeyName);
-                        MessageBoxA(hwnd, successMsg, "Hotkey Saved", MB_ICONINFORMATION);
-                        SetFocus(hwnd);
-                    } else {
-                        MessageBoxA(hwnd, "Failed to register hotkey. It might be in use by another application.", "Error", MB_ICONERROR);
-                    }
-                }
+                HWND hModal = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, "HotkeyModalClass", "Change Hotkey",
+                    WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                    modalX, modalY, modalW, modalH, hwnd, NULL, GetModuleHandle(NULL), NULL);
             }
             break;
         }
@@ -455,16 +540,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     INITCOMMONCONTROLSEX icex = { sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS };
     InitCommonControlsEx(&icex);
 
+    // Register Modal Window Class
+    WNDCLASSEXA wcModal = { 0 };
+    wcModal.cbSize = sizeof(WNDCLASSEXA);
+    wcModal.lpfnWndProc = HotkeyModalProc;
+    wcModal.hInstance = hInstance;
+    wcModal.lpszClassName = "HotkeyModalClass";
+    wcModal.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wcModal.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
+    RegisterClassExA(&wcModal);
+
+    // Register Main Window Class
     WNDCLASSEXA wc = { 0 };
     wc.cbSize = sizeof(WNDCLASSEXA);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = "UltimateAutoClicker";
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); 
-    
     wc.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
     wc.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
-
     RegisterClassExA(&wc);
 
     HWND hwnd = CreateWindowA("UltimateAutoClicker", "Ultimate AutoClicker", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
