@@ -1,4 +1,6 @@
 # build output
+/build/
+/bin/
 *.exe
 !app.ico
 *.res

@@ -112,7 +112,12 @@ struct WinSink : InputSink {
 };
 
 // ---------------------------------------------------------------- helpers
-static void SetText(HWND h, const std::wstring& s) { SetWindowTextW(h, s.c_str()); }
+static void SetText(HWND h, const std::wstring& s) {
+    std::wstring current(GetWindowTextLengthW(h) + 1, L'\0');
+    GetWindowTextW(h, &current[0], (int)current.size());
+    current.resize(wcslen(current.c_str()));
+    if (current != s) SetWindowTextW(h, s.c_str());
+}
 static void SetInt(HWND h, int id, int v) { SetDlgItemInt(h, id, (UINT)v, TRUE); }
 static int  GetInt(HWND h, int id) { return (int)GetDlgItemInt(h, id, nullptr, TRUE); }
 static bool IsChecked(HWND h, int id) { return SendMessage(GetDlgItem(h, id), BM_GETCHECK, 0, 0) == BST_CHECKED; }
@@ -142,6 +147,107 @@ static std::wstring Fmt(const wchar_t* f, ...) {
     std::vswprintf(buf, 512, fmt.c_str(), ap);
     va_end(ap);
     return buf;
+}
+
+static UINT WindowDpi(HWND hwnd) {
+    using GetDpi = UINT (WINAPI*)(HWND);
+    auto getDpi = (GetDpi)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+    if (getDpi) return getDpi(hwnd);
+    HDC dc = GetDC(hwnd);
+    UINT dpi = GetDeviceCaps(dc, LOGPIXELSX);
+    ReleaseDC(hwnd, dc);
+    return dpi;
+}
+
+static void ScaleUi(HWND hwnd, UINT dpi) {
+    UINT oldDpi = (UINT)(UINT_PTR)GetPropW(hwnd, L"UiDpi");
+    if (!oldDpi) oldDpi = 96;
+    HFONT font = CreateFontW(MulDiv(15, dpi, 96), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+    HFONT bold = CreateFontW(MulDiv(16, dpi, 96), 0, 0, 0, FW_BOLD, 0, 0, 0,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+    HFONT oldBold = (HFONT)GetPropW(hwnd, L"UiBold");
+    for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        RECT r;
+        GetWindowRect(child, &r);
+        MapWindowPoints(nullptr, hwnd, (POINT*)&r, 2);
+        wchar_t cls[32];
+        GetClassNameW(child, cls, 32);
+        int height = r.bottom - r.top;
+        if (wcscmp(cls, L"ComboBox") == 0) {
+            RECT drop;
+            SendMessage(child, CB_GETDROPPEDCONTROLRECT, 0, (LPARAM)&drop);
+            height = drop.bottom - drop.top;
+        }
+        HFONT current = (HFONT)SendMessage(child, WM_GETFONT, 0, 0);
+        SendMessage(child, WM_SETFONT, (WPARAM)((current == g_bold || (oldBold && current == oldBold)) ? bold : font), FALSE);
+        SetWindowPos(child, nullptr, MulDiv(r.left, dpi, oldDpi), MulDiv(r.top, dpi, oldDpi),
+            MulDiv(r.right - r.left, dpi, oldDpi), MulDiv(height, dpi, oldDpi), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    HFONT oldFont = (HFONT)RemovePropW(hwnd, L"UiFont");
+    if (oldFont) DeleteObject(oldFont);
+    if (oldBold) DeleteObject(oldBold);
+    SetPropW(hwnd, L"UiFont", font);
+    SetPropW(hwnd, L"UiBold", bold);
+    SetPropW(hwnd, L"UiDpi", (HANDLE)(UINT_PTR)dpi);
+    RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE);
+}
+
+static void FreeUiFonts(HWND hwnd) {
+    HFONT font = (HFONT)RemovePropW(hwnd, L"UiFont");
+    HFONT bold = (HFONT)RemovePropW(hwnd, L"UiBold");
+    if (font) DeleteObject(font);
+    if (bold) DeleteObject(bold);
+    RemovePropW(hwnd, L"UiDpi");
+}
+
+static void SizeClient(HWND hwnd, int width, int height) {
+    UINT dpi = WindowDpi(hwnd);
+    UINT contentDpi = hwnd == g_mainWnd ? 96 : dpi;
+    RECT r = {0, 0, MulDiv(width, contentDpi, 96), MulDiv(height, contentDpi, 96)};
+    using AdjustRect = BOOL (WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    auto adjust = (AdjustRect)GetProcAddress(GetModuleHandleW(L"user32.dll"), "AdjustWindowRectExForDpi");
+    DWORD style = (DWORD)GetWindowLongPtr(hwnd, GWL_STYLE);
+    if (hwnd == g_mainWnd) style &= ~WS_VSCROLL;
+    DWORD exStyle = (DWORD)GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    if (adjust) adjust(&r, style, FALSE, exStyle, dpi);
+    else AdjustWindowRectEx(&r, style, FALSE, exStyle);
+    MONITORINFO monitor = {sizeof(monitor)};
+    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor);
+    int w = r.right - r.left;
+    int h = std::min((int)(r.bottom - r.top), (int)(monitor.rcWork.bottom - monitor.rcWork.top));
+    RECT owner;
+    GetWindowRect(GetWindow(hwnd, GW_OWNER) ? GetWindow(hwnd, GW_OWNER) : hwnd, &owner);
+    int x = std::max((int)monitor.rcWork.left, std::min((int)(owner.left + owner.right - w) / 2, (int)monitor.rcWork.right - w));
+    int y = std::max((int)monitor.rcWork.top, std::min((int)(owner.top + owner.bottom - h) / 2, (int)monitor.rcWork.bottom - h));
+    SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void ScrollMain(HWND hwnd, int position) {
+    SCROLLINFO info = {sizeof(info), SIF_POS};
+    GetScrollInfo(hwnd, SB_VERT, &info);
+    int old = info.nPos;
+    info.nPos = position;
+    SetScrollInfo(hwnd, SB_VERT, &info, TRUE);
+    GetScrollInfo(hwnd, SB_VERT, &info);
+    ScrollWindowEx(hwnd, 0, old - info.nPos, nullptr, nullptr, nullptr, nullptr,
+        SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE);
+}
+
+static void UpdateScroll(HWND hwnd) {
+    RECT client;
+    GetClientRect(hwnd, &client);
+    SCROLLINFO info = {sizeof(info), SIF_RANGE | SIF_PAGE | SIF_POS};
+    GetScrollInfo(hwnd, SB_VERT, &info);
+    int old = info.nPos;
+    info.nMin = 0;
+    info.nMax = 699;
+    info.nPage = client.bottom;
+    SetScrollInfo(hwnd, SB_VERT, &info, TRUE);
+    GetScrollInfo(hwnd, SB_VERT, &info);
+    if (old != info.nPos)
+        ScrollWindowEx(hwnd, 0, old - info.nPos, nullptr, nullptr, nullptr, nullptr,
+            SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE);
 }
 
 // ---------------------------------------------------------------- ini (portable, next to the exe)
@@ -340,6 +446,10 @@ static void UpdateEnabledStates() {
     EnableWindow(GetDlgItem(g_mainWnd, ID_TEXT_EDIT), action == ACT_TYPE);
     EnableWindow(GetDlgItem(g_mainWnd, ID_RAND_MIN), IsChecked(g_mainWnd, ID_RAND_CHECK));
     EnableWindow(GetDlgItem(g_mainWnd, ID_RAND_MAX), IsChecked(g_mainWnd, ID_RAND_CHECK));
+    EnableWindow(GetDlgItem(g_mainWnd, ID_REP_COUNT), IsChecked(g_mainWnd, ID_REP_TIMES));
+    bool fixed = IsChecked(g_mainWnd, ID_POS_CUST);
+    EnableWindow(GetDlgItem(g_mainWnd, ID_POS_X), fixed);
+    EnableWindow(GetDlgItem(g_mainWnd, ID_POS_Y), fixed);
 }
 
 static void UpdateWarning() {
@@ -353,8 +463,8 @@ static void UpdateWarning() {
         swprintf_s(buf, 256, L"Interval: %.3f ms  (%.2f CPS)", (double)iv / 1000.0, cps);
     }
     std::wstring warn;
-    if (!g_cfg.randomize && iv < 5000)
-        warn = std::wstring(L"[!] ") + buf + L"  -  below 5 ms, the target app may lag.";
+    if (g_cfg.randomize ? g_cfg.randMinUs < 5000 : iv < 5000)
+        warn = std::wstring(buf) + L"\nBelow 5 ms: the target app may lag.";
     else
         warn = buf;
     SetText(GetDlgItem(g_mainWnd, ID_WARN_STATIC), warn);
@@ -648,22 +758,23 @@ static LRESULT CALLBACK HotkeyModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             g_captureValid = false;
 
             HWND l1 = CreateWindowExW(0, L"STATIC", L"Press the key combination you want to use.",
-                WS_VISIBLE | WS_CHILD, 15, 12, 290, 20, hwnd, nullptr, nullptr, nullptr);
+                WS_VISIBLE | WS_CHILD, 16, 16, 388, 24, hwnd, nullptr, nullptr, nullptr);
             SendMessage(l1, WM_SETFONT, (WPARAM)g_font, TRUE);
             HWND l2 = CreateWindowExW(0, L"STATIC", L"(press keys)",
-                WS_VISIBLE | WS_CHILD, 15, 38, 290, 22, hwnd, (HMENU)302, nullptr, nullptr);
+                WS_VISIBLE | WS_CHILD, 16, 46, 388, 48, hwnd, (HMENU)302, nullptr, nullptr);
             SendMessage(l2, WM_SETFONT, (WPARAM)g_bold, TRUE);
-            HWND l3 = CreateWindowExW(0, L"STATIC", L"Modifiers + one key, or several keys held together (X + Z).",
-                WS_VISIBLE | WS_CHILD, 15, 64, 290, 18, hwnd, nullptr, nullptr, nullptr);
+            HWND l3 = CreateWindowExW(0, L"STATIC", L"Use modifiers + a key, or hold several keys (X + Z).\nRelease the keys, then click Save. Esc cancels.",
+                WS_VISIBLE | WS_CHILD, 16, 100, 388, 44, hwnd, nullptr, nullptr, nullptr);
             SendMessage(l3, WM_SETFONT, (WPARAM)g_font, TRUE);
 
             HWND b1 = CreateWindowExW(0, L"BUTTON", L"Save", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP,
-                50, 92, 105, 30, hwnd, (HMENU)IDOK, nullptr, nullptr);
+                180, 156, 105, 32, hwnd, (HMENU)IDOK, nullptr, nullptr);
             SendMessage(b1, WM_SETFONT, (WPARAM)g_bold, TRUE);
             HWND b2 = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
-                165, 92, 105, 30, hwnd, (HMENU)IDCANCEL, nullptr, nullptr);
+                297, 156, 107, 32, hwnd, (HMENU)IDCANCEL, nullptr, nullptr);
             SendMessage(b2, WM_SETFONT, (WPARAM)g_font, TRUE);
             SetFocus(hwnd);
+            ScaleUi(hwnd, WindowDpi(hwnd));
             break;
         }
         case WM_COMMAND: {
@@ -705,6 +816,11 @@ static LRESULT CALLBACK HotkeyModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SetBkMode((HDC)wParam, TRANSPARENT);
             return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
         }
+        case WM_DPICHANGED:
+            ScaleUi(hwnd, HIWORD(wParam));
+            SizeClient(hwnd, 420, 204);
+            break;
+        case WM_DESTROY: FreeUiFonts(hwnd); break;
         default: return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     return 0;
@@ -716,6 +832,9 @@ static unsigned long long g_recLastUs = 0;
 static void RefreshSeqList(HWND hList) {
     SendMessage(hList, LB_RESETCONTENT, 0, 0);
     wchar_t buf[128];
+    int extent = 0;
+    HDC dc = GetDC(hList);
+    HGDIOBJ oldFont = SelectObject(dc, (HFONT)SendMessage(hList, WM_GETFONT, 0, 0));
     for (int i = 0; i < (int)g_cfg.seq.size(); i++) {
         const SeqPoint& p = g_cfg.seq[i];
         if (p.delayUs >= 0)
@@ -723,7 +842,13 @@ static void RefreshSeqList(HWND hList) {
         else
             swprintf_s(buf, 128, L"#%d:  (X: %d,  Y: %d)", i + 1, p.x, p.y);
         SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)buf);
+        SIZE size;
+        GetTextExtentPoint32W(dc, buf, (int)wcslen(buf), &size);
+        extent = std::max(extent, (int)size.cx + 16);
     }
+    SelectObject(dc, oldFont);
+    ReleaseDC(hList, dc);
+    SendMessage(hList, LB_SETHORIZONTALEXTENT, extent, 0);
     SendMessageW(GetDlgItem(g_mainWnd, ID_SEQ_BTN), WM_SETTEXT, 0, (LPARAM)Fmt(L"Manage Points (%d)...", (int)g_cfg.seq.size()).c_str());
 }
 
@@ -733,47 +858,48 @@ static LRESULT CALLBACK SeqModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             g_seqDlg = hwnd;
             g_seqDlgOpen = true;
             HWND l0 = CreateWindowExW(0, L"STATIC", L"Click points (recorded or manual):",
-                WS_VISIBLE | WS_CHILD, 15, 10, 300, 18, hwnd, nullptr, nullptr, nullptr);
+                WS_VISIBLE | WS_CHILD, 16, 16, 388, 22, hwnd, nullptr, nullptr, nullptr);
             SendMessage(l0, WM_SETFONT, (WPARAM)g_bold, TRUE);
 
             HWND hList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
-                WS_VISIBLE | WS_CHILD | WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP, 15, 30, 300, 130, hwnd, (HMENU)ID_SEQ_LIST, nullptr, nullptr);
+                WS_VISIBLE | WS_CHILD | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_TABSTOP, 16, 44, 388, 148, hwnd, (HMENU)ID_SEQ_LIST, nullptr, nullptr);
             SendMessage(hList, WM_SETFONT, (WPARAM)g_font, TRUE);
 
             HWND bRec = CreateWindowExW(0, L"BUTTON", L"Record clicks...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
-                15, 168, 140, 26, hwnd, (HMENU)ID_SEQ_REC_BTN, nullptr, nullptr);
+                16, 204, 202, 32, hwnd, (HMENU)ID_SEQ_REC_BTN, nullptr, nullptr);
             SendMessage(bRec, WM_SETFONT, (WPARAM)g_bold, TRUE);
             HWND bDel = CreateWindowExW(0, L"BUTTON", L"Delete Selected", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
-                163, 168, 152, 26, hwnd, (HMENU)ID_SEQ_DEL_BTN, nullptr, nullptr);
+                230, 204, 174, 32, hwnd, (HMENU)ID_SEQ_DEL_BTN, nullptr, nullptr);
             SendMessage(bDel, WM_SETFONT, (WPARAM)g_font, TRUE);
 
-            HWND lx = CreateWindowExW(0, L"STATIC", L"X:", WS_VISIBLE | WS_CHILD, 15, 206, 15, 20, hwnd, nullptr, nullptr, nullptr);
+            HWND lx = CreateWindowExW(0, L"STATIC", L"X:", WS_VISIBLE | WS_CHILD, 16, 252, 18, 24, hwnd, nullptr, nullptr, nullptr);
             SendMessage(lx, WM_SETFONT, (WPARAM)g_font, TRUE);
-            HWND hX = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_CENTER | WS_TABSTOP,
-                32, 203, 48, 23, hwnd, (HMENU)ID_SEQ_IN_X, nullptr, nullptr);
+            HWND hX = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL | ES_CENTER | WS_TABSTOP,
+                36, 248, 60, 26, hwnd, (HMENU)ID_SEQ_IN_X, nullptr, nullptr);
             SendMessage(hX, WM_SETFONT, (WPARAM)g_font, TRUE);
-            HWND ly = CreateWindowExW(0, L"STATIC", L"Y:", WS_VISIBLE | WS_CHILD, 90, 206, 15, 20, hwnd, nullptr, nullptr, nullptr);
+            HWND ly = CreateWindowExW(0, L"STATIC", L"Y:", WS_VISIBLE | WS_CHILD, 108, 252, 18, 24, hwnd, nullptr, nullptr, nullptr);
             SendMessage(ly, WM_SETFONT, (WPARAM)g_font, TRUE);
-            HWND hY = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_CENTER | WS_TABSTOP,
-                107, 203, 48, 23, hwnd, (HMENU)ID_SEQ_IN_Y, nullptr, nullptr);
+            HWND hY = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL | ES_CENTER | WS_TABSTOP,
+                128, 248, 60, 26, hwnd, (HMENU)ID_SEQ_IN_Y, nullptr, nullptr);
             SendMessage(hY, WM_SETFONT, (WPARAM)g_font, TRUE);
-            HWND ld = CreateWindowExW(0, L"STATIC", L"Delay ms:", WS_VISIBLE | WS_CHILD, 165, 206, 55, 20, hwnd, nullptr, nullptr, nullptr);
+            HWND ld = CreateWindowExW(0, L"STATIC", L"Delay ms:", WS_VISIBLE | WS_CHILD, 200, 252, 68, 24, hwnd, nullptr, nullptr, nullptr);
             SendMessage(ld, WM_SETFONT, (WPARAM)g_font, TRUE);
             HWND hD = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_CENTER | WS_TABSTOP,
-                222, 203, 48, 23, hwnd, (HMENU)ID_SEQ_IN_D, nullptr, nullptr);
+                270, 248, 60, 26, hwnd, (HMENU)ID_SEQ_IN_D, nullptr, nullptr);
             SendMessage(hD, WM_SETFONT, (WPARAM)g_font, TRUE);
 
             HWND bAdd = CreateWindowExW(0, L"BUTTON", L"Add", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
-                275, 202, 55, 25, hwnd, (HMENU)ID_SEQ_ADD_BTN, nullptr, nullptr);
+                342, 248, 62, 28, hwnd, (HMENU)ID_SEQ_ADD_BTN, nullptr, nullptr);
             SendMessage(bAdd, WM_SETFONT, (WPARAM)g_font, TRUE);
             HWND bClr = CreateWindowExW(0, L"BUTTON", L"Clear All", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
-                15, 235, 95, 25, hwnd, (HMENU)ID_SEQ_CLR_BTN, nullptr, nullptr);
+                16, 290, 108, 32, hwnd, (HMENU)ID_SEQ_CLR_BTN, nullptr, nullptr);
             SendMessage(bClr, WM_SETFONT, (WPARAM)g_font, TRUE);
             HWND bDone = CreateWindowExW(0, L"BUTTON", L"Done", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP,
-                120, 235, 115, 28, hwnd, (HMENU)IDOK, nullptr, nullptr);
+                284, 290, 120, 32, hwnd, (HMENU)IDOK, nullptr, nullptr);
             SendMessage(bDone, WM_SETFONT, (WPARAM)g_bold, TRUE);
 
             RefreshSeqList(hList);
+            ScaleUi(hwnd, WindowDpi(hwnd));
             break;
         }
         case WM_COMMAND: {
@@ -849,6 +975,12 @@ static LRESULT CALLBACK SeqModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             SetBkMode((HDC)wParam, TRANSPARENT);
             return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
         }
+        case WM_DPICHANGED:
+            ScaleUi(hwnd, HIWORD(wParam));
+            SizeClient(hwnd, 420, 338);
+            RefreshSeqList(GetDlgItem(hwnd, ID_SEQ_LIST));
+            break;
+        case WM_DESTROY: FreeUiFonts(hwnd); break;
         default: return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     return 0;
@@ -877,6 +1009,14 @@ static LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LP
 // ---------------------------------------------------------------- main window
 static void BuildUi(HWND hwnd) {
     auto Add = [&](LPCWSTR cls, LPCWSTR txt, DWORD style, int x, int y, int w, int h, int id, HFONT f = nullptr) {
+        if (wcscmp(cls, L"BUTTON") == 0 && (style & 0xf) == BS_GROUPBOX) {
+            w += 60;
+            style |= WS_GROUP;
+        }
+        x = 10 + MulDiv(x - 10, 480, 540);
+        w = MulDiv(w, 480, 540);
+        if (wcscmp(cls, L"BUTTON") == 0) style |= BS_NOTIFY;
+        if (wcscmp(cls, L"EDIT") == 0) style |= ES_AUTOHSCROLL;
         HWND c = CreateWindowExW(0, cls, txt, WS_VISIBLE | WS_CHILD | style, x, y, w, h, hwnd,
                                  (HMENU)(UINT_PTR)id, nullptr, nullptr);
         SendMessage(c, WM_SETFONT, (WPARAM)(f ? f : g_font), TRUE);
@@ -900,7 +1040,7 @@ static void BuildUi(HWND hwnd) {
     SetWindowSubclass(hSecs, EditSubclassProc, 1, (DWORD_PTR)hwnd);
     SetWindowSubclass(hMs, EditSubclassProc, 1, (DWORD_PTR)hwnd);
     SetWindowSubclass(hUs, EditSubclassProc, 1, (DWORD_PTR)hwnd);
-    Add(L"STATIC", L"", 0, 16, 56, 470, 18, ID_WARN_STATIC);
+    Add(L"STATIC", L"", 0, 22, 50, 516, 30, ID_WARN_STATIC);
 
     // --- randomisation
     Add(L"BUTTON", L"Randomisation", BS_GROUPBOX, 10, 90, 480, 48, 0);
@@ -918,7 +1058,7 @@ static void BuildUi(HWND hwnd) {
     Add(L"STATIC", L"Type:", 0, 222, 162, 40, 20, 0);
     HWND hTypeCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP, 264, 158, 90, 120, ID_TYPE_COMBO);
     Add(L"STATIC", L"Mode:", 0, 362, 162, 42, 20, 0);
-    HWND hModeCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP, 406, 158, 78, 120, ID_MODE_COMBO);
+    HWND hModeCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP, 406, 158, 132, 120, ID_MODE_COMBO);
     SendMessageW(hBtnCombo, CB_ADDSTRING, 0, (LPARAM)L"Left");
     SendMessageW(hBtnCombo, CB_ADDSTRING, 0, (LPARAM)L"Right");
     SendMessageW(hBtnCombo, CB_ADDSTRING, 0, (LPARAM)L"Middle");
@@ -941,26 +1081,26 @@ static void BuildUi(HWND hwnd) {
     SendMessageW(hActCombo, CB_ADDSTRING, 0, (LPARAM)L"Type Text");
     SendMessage(hActCombo, CB_SETCURSEL, 0, 0);
     Add(L"STATIC", L"Text:", 0, 228, 223, 40, 20, 0);
-    Add(L"EDIT", L"Hello", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 270, 219, 214, 23, ID_TEXT_EDIT);
+    Add(L"EDIT", L"Hello", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 270, 219, 268, 23, ID_TEXT_EDIT);
 
     // --- repeat
     Add(L"BUTTON", L"Click Repeat", BS_GROUPBOX, 10, 266, 480, 48, 0);
-    Add(L"BUTTON", L"Repeat until stopped", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 22, 284, 155, 20, ID_REP_INF);
-    Add(L"BUTTON", L"Repeat", BS_AUTORADIOBUTTON, 205, 284, 55, 20, ID_REP_TIMES);
-    Add(L"STATIC", L"times", 0, 263, 284, 36, 20, 0);
-    Add(L"EDIT", L"10", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 302, 282, 60, 23, ID_REP_COUNT);
+    Add(L"BUTTON", L"Repeat until stopped", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 22, 284, 180, 20, ID_REP_INF);
+    Add(L"BUTTON", L"Repeat", BS_AUTORADIOBUTTON, 224, 284, 78, 20, ID_REP_TIMES);
+    Add(L"EDIT", L"10", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 310, 282, 72, 23, ID_REP_COUNT);
+    Add(L"STATIC", L"times", 0, 392, 284, 50, 20, 0);
 
     // --- cursor position
     Add(L"BUTTON", L"Cursor Position", BS_GROUPBOX, 10, 320, 480, 105, 0);
-    Add(L"BUTTON", L"Current Location", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 22, 338, 125, 20, ID_POS_CUR);
-    Add(L"BUTTON", L"Specific Location", BS_AUTORADIOBUTTON, 22, 364, 115, 20, ID_POS_CUST);
-    Add(L"STATIC", L"X:", 0, 145, 364, 16, 20, 0);
-    Add(L"EDIT", L"0", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 163, 362, 48, 23, ID_POS_X);
-    Add(L"STATIC", L"Y:", 0, 219, 364, 16, 20, 0);
-    Add(L"EDIT", L"0", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 237, 362, 48, 23, ID_POS_Y);
-    Add(L"BUTTON", L"Pick Location", BS_PUSHBUTTON | WS_TABSTOP, 295, 360, 80, 26, ID_PICK_BTN);
-    Add(L"BUTTON", L"Consecutive Points", BS_AUTORADIOBUTTON, 22, 392, 140, 20, ID_POS_SEQ);
-    Add(L"BUTTON", L"Manage Points (0)...", BS_PUSHBUTTON | WS_TABSTOP, 170, 390, 190, 26, ID_SEQ_BTN);
+    Add(L"BUTTON", L"Current Location", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 22, 338, 160, 20, ID_POS_CUR);
+    Add(L"BUTTON", L"Specific Location", BS_AUTORADIOBUTTON, 22, 364, 160, 20, ID_POS_CUST);
+    Add(L"STATIC", L"X:", 0, 190, 364, 18, 20, 0);
+    Add(L"EDIT", L"0", WS_BORDER | WS_TABSTOP | ES_CENTER, 210, 362, 64, 23, ID_POS_X);
+    Add(L"STATIC", L"Y:", 0, 284, 364, 18, 20, 0);
+    Add(L"EDIT", L"0", WS_BORDER | WS_TABSTOP | ES_CENTER, 304, 362, 64, 23, ID_POS_Y);
+    Add(L"BUTTON", L"Pick Location", BS_PUSHBUTTON | WS_TABSTOP, 380, 360, 158, 28, ID_PICK_BTN);
+    Add(L"BUTTON", L"Consecutive Points", BS_AUTORADIOBUTTON, 22, 392, 174, 20, ID_POS_SEQ);
+    Add(L"BUTTON", L"Manage Points (0)...", BS_PUSHBUTTON | WS_TABSTOP, 210, 390, 328, 28, ID_SEQ_BTN);
 
     // --- timing
     Add(L"BUTTON", L"Timing", BS_GROUPBOX, 10, 431, 480, 48, 0);
@@ -970,27 +1110,27 @@ static void BuildUi(HWND hwnd) {
     Add(L"STATIC", L"Hold:", 0, 200, 449, 38, 20, 0);
     Add(L"EDIT", L"10", WS_BORDER | WS_TABSTOP | ES_CENTER, 240, 446, 50, 23, ID_HOLD_EDIT);
     Add(L"STATIC", L"ms", 0, 294, 449, 26, 20, 0);
-    Add(L"STATIC", L"(button down time)", 0, 326, 449, 150, 20, 0);
+    Add(L"STATIC", L"(button down time)", 0, 326, 449, 212, 20, 0);
 
     // --- hotkey
     Add(L"BUTTON", L"Hotkey", BS_GROUPBOX, 10, 485, 480, 48, 0);
-    Add(L"STATIC", L"Hotkey: F6", 0, 22, 503, 240, 20, ID_HOTKEY_LABEL, g_bold);
-    Add(L"BUTTON", L"Change Hotkey...", BS_PUSHBUTTON | WS_TABSTOP, 320, 499, 150, 26, ID_CHANGE_HOTKEY_BTN);
+    Add(L"STATIC", L"Hotkey: F6", SS_ENDELLIPSIS, 22, 503, 336, 20, ID_HOTKEY_LABEL, g_bold);
+    Add(L"BUTTON", L"Change Hotkey...", BS_PUSHBUTTON | WS_TABSTOP, 370, 499, 168, 28, ID_CHANGE_HOTKEY_BTN);
 
     // --- profiles
     Add(L"BUTTON", L"Profiles", BS_GROUPBOX, 10, 539, 480, 48, 0);
-    HWND hProfCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWN | WS_TABSTOP | ES_AUTOHSCROLL, 22, 557, 200, 120, ID_PROF_COMBO);
+    HWND hProfCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWN | WS_TABSTOP | ES_AUTOHSCROLL, 22, 555, 242, 120, ID_PROF_COMBO);
     (void)hProfCombo;
-    Add(L"BUTTON", L"Save", BS_PUSHBUTTON | WS_TABSTOP, 228, 555, 66, 25, ID_PROF_SAVE);
-    Add(L"BUTTON", L"Load", BS_PUSHBUTTON | WS_TABSTOP, 300, 555, 66, 25, ID_PROF_LOAD);
-    Add(L"BUTTON", L"Delete", BS_PUSHBUTTON | WS_TABSTOP, 372, 555, 96, 25, ID_PROF_DEL);
+    Add(L"BUTTON", L"Save", BS_PUSHBUTTON | WS_TABSTOP, 276, 555, 76, 28, ID_PROF_SAVE);
+    Add(L"BUTTON", L"Load", BS_PUSHBUTTON | WS_TABSTOP, 364, 555, 76, 28, ID_PROF_LOAD);
+    Add(L"BUTTON", L"Delete", BS_PUSHBUTTON | WS_TABSTOP, 452, 555, 86, 28, ID_PROF_DEL);
 
     // --- status
-    Add(L"STATIC", L"Clicks: 0", 0, 12, 592, 140, 20, ID_STAT_CLICKS);
-    Add(L"STATIC", L"Time: 00:00:00", 0, 160, 592, 140, 20, ID_STAT_TIME);
-    Add(L"STATIC", L"CPS: 0.0", 0, 310, 592, 140, 20, ID_STAT_CPS);
-    Add(L"BUTTON", L"Always on Top", BS_AUTOCHECKBOX | WS_TABSTOP, 12, 614, 130, 20, ID_TOP_CHECK);
-    Add(L"BUTTON", L"START CLICKING (F6)", BS_PUSHBUTTON | WS_TABSTOP, 10, 640, 480, 46, ID_MAIN_BTN, g_bold);
+    Add(L"STATIC", L"Clicks: 0", 0, 22, 596, 170, 20, ID_STAT_CLICKS);
+    Add(L"STATIC", L"Time: 00:00:00", 0, 202, 596, 170, 20, ID_STAT_TIME);
+    Add(L"STATIC", L"CPS: 0.0", 0, 382, 596, 156, 20, ID_STAT_CPS);
+    Add(L"BUTTON", L"Always on Top", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 620, 180, 20, ID_TOP_CHECK);
+    Add(L"BUTTON", L"START CLICKING (F6)", BS_PUSHBUTTON | WS_TABSTOP, 10, 650, 540, 36, ID_MAIN_BTN, g_bold);
 
     SendMessage(GetDlgItem(hwnd, ID_REP_INF), BM_SETCHECK, BST_CHECKED, 0);
     SendMessage(GetDlgItem(hwnd, ID_POS_CUR), BM_SETCHECK, BST_CHECKED, 0);
@@ -1003,18 +1143,12 @@ static void RefreshProfileCombo() {
         SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)g_profiles[i].c_str());
 }
 
-static void CenterOn(HWND hwnd, int w, int h) {
-    RECT rc; GetWindowRect(g_mainWnd, &rc);
-    int x = rc.left + ((rc.right - rc.left) - w) / 2;
-    int y = rc.top + ((rc.bottom - rc.top) - h) / 2;
-    SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
             g_mainWnd = hwnd;
             BuildUi(hwnd);
+            ScaleUi(hwnd, 96);
             ApplyConfigToUi();
             UpdateEnabledStates();
             UpdateWarning();
@@ -1058,6 +1192,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_cfg.posMode = POS_FIXED;
             g_cfg.targetX = (int)wParam;
             g_cfg.targetY = (int)lParam;
+            UpdateEnabledStates();
             break;
         }
         case WM_APP_TRAY: {
@@ -1067,9 +1202,63 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         case WM_SIZE:
             if (wParam == SIZE_MINIMIZED) ShowWindow(hwnd, SW_HIDE);
+            else UpdateScroll(hwnd);
             break;
+        case WM_VSCROLL: {
+            SCROLLINFO info = {sizeof(info), SIF_ALL};
+            GetScrollInfo(hwnd, SB_VERT, &info);
+            int pos = info.nPos;
+            switch (LOWORD(wParam)) {
+                case SB_LINEUP: pos -= MulDiv(32, WindowDpi(hwnd), 96); break;
+                case SB_LINEDOWN: pos += MulDiv(32, WindowDpi(hwnd), 96); break;
+                case SB_PAGEUP: pos -= info.nPage; break;
+                case SB_PAGEDOWN: pos += info.nPage; break;
+                case SB_THUMBTRACK: case SB_THUMBPOSITION: pos = info.nTrackPos; break;
+                case SB_TOP: pos = 0; break;
+                case SB_BOTTOM: pos = info.nMax; break;
+            }
+            ScrollMain(hwnd, pos);
+            break;
+        }
+        case WM_MOUSEWHEEL: {
+            static int wheel = 0;
+            wheel += GET_WHEEL_DELTA_WPARAM(wParam);
+            SCROLLINFO info = {sizeof(info), SIF_POS};
+            GetScrollInfo(hwnd, SB_VERT, &info);
+            ScrollMain(hwnd, info.nPos - (wheel / WHEEL_DELTA) * MulDiv(96, WindowDpi(hwnd), 96));
+            wheel %= WHEEL_DELTA;
+            break;
+        }
+        case WM_DPICHANGED: {
+            ScrollMain(hwnd, 0);
+            ScaleUi(hwnd, 96);
+            RECT* r = (RECT*)lParam;
+            SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            SizeClient(hwnd, 500, 700);
+            break;
+        }
         case WM_COMMAND: {
             int id = LOWORD(wParam);
+            if (HIWORD(wParam) == EN_SETFOCUS || HIWORD(wParam) == CBN_SETFOCUS ||
+                HIWORD(wParam) == BN_SETFOCUS) {
+                HWND focus = GetFocus();
+                if (focus && IsChild(hwnd, focus)) {
+                    RECT r, client;
+                    GetWindowRect(focus, &r);
+                    MapWindowPoints(nullptr, hwnd, (POINT*)&r, 2);
+                    GetClientRect(hwnd, &client);
+                    SCROLLINFO info = {sizeof(info), SIF_POS};
+                    GetScrollInfo(hwnd, SB_VERT, &info);
+                    if (r.top < 0) ScrollMain(hwnd, info.nPos + r.top);
+                    else if (r.bottom > client.bottom) ScrollMain(hwnd, info.nPos + r.bottom - client.bottom);
+                }
+            }
+            if (lParam && HIWORD(wParam) != BN_CLICKED) {
+                wchar_t cls[32];
+                GetClassNameW((HWND)lParam, cls, 32);
+                if (wcscmp(cls, L"Button") == 0) break;
+            }
             switch (id) {
                 case ID_MAIN_BTN: ToggleClicking(); break;
                 case ID_PICK_BTN: {
@@ -1083,7 +1272,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     EnableWindow(hwnd, FALSE);
                     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"SeqModalClass", L"Manage Consecutive Clicks",
                         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE, 0, 0, 340, 275, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-                    CenterOn(dlg, 340, 275);
+                    SizeClient(dlg, 420, 338);
                     break;
                 }
                 case ID_CHANGE_HOTKEY_BTN: {
@@ -1092,7 +1281,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     g_hotkeyDlgOpen = true;
                     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"HotkeyModalClass", L"Change Hotkey",
                         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE, 0, 0, 320, 140, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-                    CenterOn(dlg, 320, 140);
+                    SizeClient(dlg, 420, 204);
                     break;
                 }
                 case ID_TOP_CHECK: {
@@ -1102,7 +1291,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     break;
                 }
                 case ID_ACTION_COMBO: UpdateEnabledStates(); break;
-                case ID_RAND_CHECK: UpdateEnabledStates(); break;
+                case ID_REP_INF: case ID_REP_TIMES:
+                case ID_POS_CUR: case ID_POS_CUST: case ID_POS_SEQ:
+                    UpdateEnabledStates(); break;
+                case ID_RAND_CHECK: UpdateEnabledStates(); ApplyUiToConfig(); UpdateWarning(); break;
+                case ID_RAND_MIN: case ID_RAND_MAX:
                 case ID_HRS: case ID_MINS: case ID_SECS: case ID_MS: case ID_US:
                     ApplyUiToConfig();
                     UpdateWarning();
@@ -1156,7 +1349,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         case WM_CTLCOLORSTATIC: {
             if ((HWND)lParam == GetDlgItem(hwnd, ID_WARN_STATIC)) {
-                SetTextColor((HDC)wParam, RGB(200, 30, 30));
+                HIGHCONTRASTW contrast = {sizeof(contrast)};
+                SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0);
+                bool fast = g_cfg.randomize ? g_cfg.randMinUs < 5000 : g_cfg.intervalUs < 5000;
+                SetTextColor((HDC)wParam, fast && !(contrast.dwFlags & HCF_HIGHCONTRASTON) ?
+                    RGB(160, 45, 20) : GetSysColor(COLOR_BTNTEXT));
                 SetBkMode((HDC)wParam, TRANSPARENT);
                 return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
             }
@@ -1167,6 +1364,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyWindow(hwnd);
             break;
         case WM_DESTROY: {
+            FreeUiFonts(hwnd);
             g_running = false;
             if (g_engine && g_engine->IsRunning()) { g_engine->Stop(); SetEvent(hInterrupt); }
             KillTimer(hwnd, 1);
@@ -1216,6 +1414,47 @@ static std::wstring CtlText(HWND h, int id) {
     return buf;
 }
 
+static void CheckControlBounds(HWND parent) {
+    RECT client;
+    GetClientRect(parent, &client);
+    for (HWND child = GetWindow(parent, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        RECT r;
+        GetWindowRect(child, &r);
+        MapWindowPoints(nullptr, parent, (POINT*)&r, 2);
+        ST_CHECK(r.left >= 0 && r.top >= 0 && r.right <= client.right && r.bottom <= client.bottom,
+                 "control fits inside its client area");
+    }
+}
+
+static void CheckCaptionFits(HWND parent, int id) {
+    HWND child = GetDlgItem(parent, id);
+    RECT r;
+    GetClientRect(child, &r);
+    HDC dc = GetDC(child);
+    HGDIOBJ old = SelectObject(dc, (HFONT)SendMessage(child, WM_GETFONT, 0, 0));
+    std::wstring text = CtlText(parent, id);
+    SIZE size;
+    GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &size);
+    ST_CHECK(size.cx + 12 <= r.right && size.cy <= r.bottom, "button caption fits without clipping");
+    SelectObject(dc, old);
+    ReleaseDC(child, dc);
+}
+
+static void CheckDialogScaling(HWND dialog, int width, int height) {
+    UINT original = WindowDpi(dialog);
+    for (UINT dpi : {96u, 144u, 192u}) {
+        ScaleUi(dialog, dpi);
+        SetWindowPos(dialog, nullptr, 0, 0, MulDiv(width, dpi, 96) + 40,
+            MulDiv(height, dpi, 96) + 80, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        CheckControlBounds(dialog);
+        LOGFONTW font;
+        GetObjectW((HFONT)SendMessage(GetDlgItem(dialog, IDOK), WM_GETFONT, 0, 0), sizeof(font), &font);
+        ST_CHECK(font.lfHeight == MulDiv(16, dpi, 96), "dialog font scales with DPI");
+        CheckCaptionFits(dialog, IDOK);
+    }
+    ScaleUi(dialog, original);
+}
+
 static int RunSelfTest(HWND hwnd) {
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         FILE* f = nullptr;
@@ -1257,8 +1496,46 @@ static int RunSelfTest(HWND hwnd) {
 
     // --- hotkey label
     SelfTestLog("- hotkey\n");
+    RECT compact;
+    GetClientRect(hwnd, &compact);
+    ST_CHECK(compact.right == 500, "main window keeps the original compact width");
+    RECT beforeDpi;
+    GetWindowRect(hwnd, &beforeDpi);
+    SendMessage(hwnd, WM_DPICHANGED, MAKEWPARAM(192, 192), (LPARAM)&beforeDpi);
+    GetClientRect(hwnd, &compact);
+    ST_CHECK(compact.right <= 500 && compact.bottom <= 700, "high DPI keeps the original pixel footprint");
+    MONITORINFO monitor = {sizeof(monitor)};
+    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor);
+    RECT outer;
+    GetWindowRect(hwnd, &outer);
+    if (monitor.rcWork.bottom - monitor.rcWork.top >= outer.bottom - outer.top + 700 - compact.bottom) {
+        ST_CHECK(compact.bottom == 700, "window borders leave the full content height");
+        ST_CHECK(!(GetWindowLongPtr(hwnd, GWL_STYLE) & WS_VSCROLL), "full compact layout needs no scrollbar");
+    }
     ST_CHECK(CtlText(hwnd, ID_HOTKEY_LABEL).find(L"F6") != std::wstring::npos, "the default hotkey is shown");
     ST_CHECK(CtlText(hwnd, ID_MAIN_BTN) == L"START CLICKING (F6)", "the start button shows the full hotkey");
+    CheckCaptionFits(hwnd, ID_MAIN_BTN);
+    CheckCaptionFits(hwnd, ID_PICK_BTN);
+    CheckCaptionFits(hwnd, ID_CHANGE_HOTKEY_BTN);
+    SendMessage(hwnd, WM_COMMAND, MAKEWPARAM(ID_MAIN_BTN, BN_SETFOCUS), (LPARAM)GetDlgItem(hwnd, ID_MAIN_BTN));
+    ST_CHECK(!g_engine->IsRunning(), "focusing start does not activate it");
+    ST_CHECK(!IsWindowEnabled(GetDlgItem(hwnd, ID_REP_COUNT)), "unlimited repeat disables the count");
+    ST_CHECK(!IsWindowEnabled(GetDlgItem(hwnd, ID_POS_X)), "current position disables fixed coordinates");
+
+    SelfTestLog("- small-screen scrolling\n");
+    RECT originalWindow;
+    GetWindowRect(hwnd, &originalWindow);
+    SetWindowPos(hwnd, nullptr, 0, 0, originalWindow.right - originalWindow.left, 400,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SendMessage(hwnd, WM_VSCROLL, SB_BOTTOM, 0);
+    RECT start, client;
+    GetWindowRect(GetDlgItem(hwnd, ID_MAIN_BTN), &start);
+    MapWindowPoints(nullptr, hwnd, (POINT*)&start, 2);
+    GetClientRect(hwnd, &client);
+    ST_CHECK(start.top >= 0 && start.bottom <= client.bottom, "start button is reachable on a short screen");
+    ScrollMain(hwnd, 0);
+    SetWindowPos(hwnd, nullptr, 0, 0, originalWindow.right - originalWindow.left,
+        originalWindow.bottom - originalWindow.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     // --- countdown + repeat N + stats
     SelfTestLog("- start countdown, repeat N, live stats\n");
@@ -1336,12 +1613,19 @@ static int RunSelfTest(HWND hwnd) {
         SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_CHANGE_HOTKEY_BTN, 0);
         HWND hk = FindWindowW(L"HotkeyModalClass", nullptr);
         ST_CHECK(hk != nullptr, "the hotkey dialog opens");
+        if (hk) { CheckControlBounds(hk); CheckDialogScaling(hk, 420, 204); }
         if (hk) { PostMessage(hk, WM_CLOSE, 0, 0); PumpMessages(200); }
         ST_CHECK(FindWindowW(L"HotkeyModalClass", nullptr) == nullptr, "the hotkey dialog closes");
 
         SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_SEQ_BTN, 0);
         HWND sq = FindWindowW(L"SeqModalClass", nullptr);
         ST_CHECK(sq != nullptr, "the points dialog opens");
+        if (sq) {
+            CheckControlBounds(sq);
+            SetDlgItemTextW(sq, ID_SEQ_REC_BTN, L"Stop recording (ESC)");
+            CheckCaptionFits(sq, ID_SEQ_REC_BTN);
+            CheckDialogScaling(sq, 420, 338);
+        }
         if (sq) { PostMessage(sq, WM_CLOSE, 0, 0); PumpMessages(200); }
         ST_CHECK(FindWindowW(L"SeqModalClass", nullptr) == nullptr, "the points dialog closes");
     }
@@ -1439,9 +1723,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     RECT rc = { 0, 0, 500, 700 };
     AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
     HWND hwnd = CreateWindowExW(0, L"UltimateAutoClicker", L"Ultimate AutoClicker",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VSCROLL,
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, hInstance, nullptr);
 
+    SizeClient(hwnd, 500, 700);
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
@@ -1464,7 +1749,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
-        if (!IsDialogMessage(hwnd, &msg)) {
+        HWND dialog = g_hotkeyDlgOpen ? g_hotkeyDlg : (g_seqDlgOpen ? g_seqDlg : hwnd);
+        if (!IsWindow(dialog) || !IsDialogMessage(dialog, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

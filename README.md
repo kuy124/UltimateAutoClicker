@@ -16,13 +16,15 @@ Written in pure C++ against raw Windows APIs, it utilizes kernel high-resolution
 ### Option A: 1-Click Build Script (`build.bat`)
 If you have MinGW-w64 / GCC installed:
 1. Double-click `build.bat` in the project directory.
-2. The script compiles `resource.rc` and links `UltimateAutoClicker.exe` automatically with aggressive binary optimizations.
+2. The script compiles `assets/resource.rc` and builds `bin/UltimateAutoClicker.exe`.
 
 ### Option B: Manual Command Line Compilation
 From your terminal inside the project directory:
 ```bash
-windres resource.rc -O coff -o resource.res
-g++ core.cpp main.cpp resource.res -o UltimateAutoClicker.exe -mwindows -lcomctl32 -lshell32 -static -s -Os -fno-exceptions -fno-rtti -DUNICODE -D_UNICODE
+mkdir build
+mkdir bin
+windres -I assets assets/resource.rc -O coff -o build/resource.res
+g++ src/core.cpp src/main.cpp build/resource.res -o bin/UltimateAutoClicker.exe -mwindows -lcomctl32 -lshell32 -static -s -Os -fno-exceptions -fno-rtti -DUNICODE -D_UNICODE
 ```
 
 > `-DUNICODE -D_UNICODE` matters: without it `DefWindowProc` resolves to the ANSI variant and mangles wide strings.
@@ -30,6 +32,18 @@ g++ core.cpp main.cpp resource.res -o UltimateAutoClicker.exe -mwindows -lcomctl
 <hr>
 
 ## Core Features & Capabilities
+
+### Project layout
+
+```text
+src/       C++ application and engine
+assets/    Icon, manifest, and Windows resource file
+tests/     Engine test source
+build/     Generated test executables and compiled resources (ignored)
+bin/       Application executable and portable settings (ignored)
+```
+
+Run `build.bat` or `test.bat` from the project root. Launch the app from `bin/UltimateAutoClicker.exe`.
 
 ### 1. Zero-Drift QPC Engine (1,000+ CPS)
 * **Master Grid Scheduling:** Employs `QueryPerformanceCounter` (QPC) absolute time grid tracking. Successive clicks are anchored to hardware timestamp deadlines, eliminating cumulative delay drift entirely.
@@ -52,7 +66,7 @@ g++ core.cpp main.cpp resource.res -o UltimateAutoClicker.exe -mwindows -lcomctl
 
 ### 5. Full High-DPI Scaling Support (Per-Monitor V2)
 * Coordinates remain accurate on displays scaled at **125%**, **150%**, **175%**, or **200%+**.
-* Window layout dimensions adjust via `AdjustWindowRectEx` so no controls are clipped.
+* The main window keeps its original compact 500 × 700 pixel layout, including on scaled displays. Dialog controls and fonts scale with display DPI, and their sizes account for title bars and borders. The main window scrolls on shorter screens.
 
 ### 6. Smart Interval Auto-Conversion
 * Enter decimals or large numbers across **Hours**, **Minutes**, **Seconds**, **Milliseconds**, and **Microseconds ($\mu\text{s}$)** fields.
@@ -111,7 +125,7 @@ test.bat
 The suite has two parts:
 
 * **153 engine unit checks** (`tests.exe`) run the click engine on a virtual clock: interval maths, the interval clamp, randomised intervals, drift free scheduling, double clicks, hold mode, sequence playback with per point delays, scrolling, auto typing, the hotkey matcher and the config codec. They also cover the regressions for the endless "repeat N" restart and the zero interval spin lock. The virtual clock keeps the results deterministic.
-* **32 GUI checks** (`guitest.exe --selftest`) drive the real window: title, interval conversion, the countdown including cancelling it, the live statistics, the settings file round trip, profiles and the modal dialogs.
+* **126 GUI checks** (`guitest.exe --selftest`) drive the real window: title, interval conversion, countdown cancellation, live statistics, settings round trip, profiles, modal dialogs, control bounds and font scaling at 100%/150%/200%, button text fit, compact window size across DPI changes, and small-screen scrolling.
 
 <hr>
 
