@@ -1,0 +1,9 @@
+# build output
+*.exe
+!app.ico
+*.res
+*.o
+*.obj
+
+# runtime settings
+UltimateAutoClicker.ini

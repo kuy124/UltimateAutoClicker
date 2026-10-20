@@ -1,166 +1,871 @@
-#pragma comment(linker,"\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+// main.cpp - Win32 GUI for Ultimate AutoClicker.
+#include "core.h"
 
 #include <windows.h>
 #include <commctrl.h>
-#include <stdlib.h>
+#include <shellapi.h>
+#include <cstdarg>
+#include <cwchar>
+#include <string>
+#include <vector>
+#include <map>
+#include <algorithm>
 
-#define IDI_APPICON 101
+using namespace ac;
 
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x0002
-#endif
-
-// Control IDs
+// ---------------------------------------------------------------- ids
 enum {
     ID_HRS = 201, ID_MINS, ID_SECS, ID_MS, ID_US, ID_WARN_STATIC,
-    ID_BTN_COMBO, ID_TYPE_COMBO,
+    ID_BTN_COMBO, ID_TYPE_COMBO, ID_MODE_COMBO,
+    ID_ACTION_COMBO, ID_TEXT_EDIT,
+    ID_RAND_CHECK, ID_RAND_MIN, ID_RAND_MAX,
     ID_REP_INF, ID_REP_TIMES, ID_REP_COUNT,
     ID_POS_CUR, ID_POS_CUST, ID_POS_X, ID_POS_Y, ID_PICK_BTN,
     ID_POS_SEQ, ID_SEQ_BTN,
+    ID_DELAY_EDIT, ID_HOLD_EDIT,
     ID_HOTKEY_LABEL, ID_CHANGE_HOTKEY_BTN,
     ID_TOP_CHECK, ID_MAIN_BTN,
-    ID_SEQ_LIST = 401, ID_SEQ_ADD_BTN, ID_SEQ_PICK_BTN, ID_SEQ_DEL_BTN, ID_SEQ_CLR_BTN, ID_SEQ_IN_X, ID_SEQ_IN_Y
+    ID_STAT_CLICKS, ID_STAT_TIME, ID_STAT_CPS,
+    ID_PROF_COMBO, ID_PROF_SAVE, ID_PROF_LOAD, ID_PROF_DEL,
+    ID_SEQ_LIST = 401, ID_SEQ_ADD_BTN, ID_SEQ_DEL_BTN, ID_SEQ_CLR_BTN,
+    ID_SEQ_IN_X, ID_SEQ_IN_Y, ID_SEQ_IN_D, ID_SEQ_REC_BTN
 };
 
-// Global State
-volatile bool running = true;
-volatile bool clicking = false;
-volatile long long intervalUs = 100000; // Microseconds (100ms default)
-volatile int mouseBtn = 0, clickType = 0, maxClicks = 0, clicksDone = 0;
-volatile int posMode = 0;
-volatile int targetX = 0, targetY = 0;
-POINT seqPoints[2048];
-volatile int seqCount = 0;
-volatile int seqIndex = 0;
-HWND hSeqModalWnd = NULL;
-bool g_pickingForSeq = false;
+#define WM_APP_TRAY    (WM_APP + 1)
+#define WM_APP_PICK   (WM_APP + 2)
+#define WM_APP_REC    (WM_APP + 3)
+#define WM_APP_STATE  (WM_APP + 4)
 
-HANDLE hTimerHandle = NULL;
-HMODULE hWinmm = NULL;
-HMODULE hNtdll = NULL;
-bool g_isFormatting = false;
+#define IDI_APPICON 101
 
-typedef NTSTATUS (NTAPI *pfnNtSetTimerResolution)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG ActualResolution);
-typedef MMRESULT (WINAPI *pfnTimeBeginPeriod)(UINT);
-typedef MMRESULT (WINAPI *pfnTimeEndPeriod)(UINT);
+// ---------------------------------------------------------------- globals
+static Config   g_cfg;
+static Engine*  g_engine = nullptr;
+static Clock*   g_clock = nullptr;
+static InputSink* g_sink = nullptr;
 
-// Hotkey State
-WORD currentHkVal = MAKEWORD(VK_F6, 0); // Default F6
-char currentHotkeyName[64] = "F6";
+static HWND  g_mainWnd = nullptr;
+static HFONT g_font = nullptr, g_bold = nullptr;
+static HHOOK g_kbHook = nullptr, g_mouseHook = nullptr;
+static HANDLE hWake = nullptr, hInterrupt = nullptr;
+static bool  g_running = true;
+static bool  g_periodActive = false;
+static bool  g_lastBusy = false;
 
-HWND hMainWnd;
-HHOOK hMouseHook = NULL;
-HFONT hFont = NULL, hBold = NULL;
+static int   g_pickMode = 0;              // 0 none, 1 pick location, 2 record clicks
+static bool  g_hotkeyDlgOpen = false;
+static bool  g_seqDlgOpen = false;
+static HWND  g_seqDlg = nullptr;
 
-HANDLE hClickEvent = NULL;
+// hotkey tracking
+static std::vector<int> g_pressedKeys;
+static BYTE g_heldMods = 0;
+static bool g_capturing = false;
+static std::vector<int> g_captureHeld;
+static BYTE g_captureHeldMods = 0;
+static Combo g_captureResult;
+static bool  g_captureValid = false;
+static HWND  g_hotkeyDlg = nullptr;
 
-// Helper to format hotkey key combinations into readable text
-void FormatHotkeyName(WORD hkVal, char* outBuffer, size_t bufSize) {
-    UINT vkey = LOBYTE(hkVal);
-    UINT mods = HIBYTE(hkVal);
-    
-    outBuffer[0] = '\0';
-    if (mods & HOTKEYF_CONTROL) lstrcatA(outBuffer, "Ctrl + ");
-    if (mods & HOTKEYF_SHIFT)   lstrcatA(outBuffer, "Shift + ");
-    if (mods & HOTKEYF_ALT)     lstrcatA(outBuffer, "Alt + ");
+static std::vector<std::wstring> g_profiles;
+static std::map<std::wstring, std::wstring> g_profileData;
+static std::wstring g_iniPath;
 
-    char keyName[32] = {0};
-    LONG scanCode = MapVirtualKeyA(vkey, MAPVK_VK_TO_VSC) << 16;
-    switch (vkey) {
-        case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
-        case VK_PRIOR: case VK_NEXT: case VK_END: case VK_HOME:
-        case VK_INSERT: case VK_DELETE: case VK_DIVIDE: case VK_NUMLOCK:
-            scanCode |= 0x01000000; break;
+// ---------------------------------------------------------------- win32 clock / sink
+struct WinClock : Clock {
+    HANDLE hTimer = nullptr;
+    HANDLE hInterrupt = nullptr;
+    LARGE_INTEGER qpf{};
+
+    unsigned long long NowUs() override {
+        LARGE_INTEGER c; QueryPerformanceCounter(&c);
+        return (unsigned long long)((c.QuadPart * 1000000LL) / qpf.QuadPart);
     }
-    GetKeyNameTextA(scanCode, keyName, sizeof(keyName));
-    lstrcatA(outBuffer, keyName);
-}
 
-LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && wParam == WM_LBUTTONDOWN) {
-        MSLLHOOKSTRUCT* pMouse = (MSLLHOOKSTRUCT*)lParam;
-        if (g_pickingForSeq && hSeqModalWnd) {
-            PostMessage(hSeqModalWnd, WM_USER + 3, (WPARAM)pMouse->pt.x, (LPARAM)pMouse->pt.y);
-        } else {
-            PostMessage(hMainWnd, WM_USER + 2, (WPARAM)pMouse->pt.x, (LPARAM)pMouse->pt.y);
+    bool WaitUntilUs(unsigned long long targetUs, const std::atomic<bool>* cancel) override {
+        for (;;) {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            unsigned long long nowUs = (unsigned long long)((now.QuadPart * 1000000LL) / qpf.QuadPart);
+            if (nowUs >= targetUs) return true;
+            if (cancel && cancel->load()) return false;
+
+            LONGLONG remainingTicks = (LONGLONG)(((long long)(targetUs - nowUs) * qpf.QuadPart) / 1000000LL);
+            LONGLONG coarseThreshold = (2000LL * qpf.QuadPart) / 1000000LL;
+            if (remainingTicks > coarseThreshold) {
+                LONGLONG coarseTicks = remainingTicks - (1500LL * qpf.QuadPart) / 1000000LL;
+                LARGE_INTEGER due; due.QuadPart = -((coarseTicks * 10000000LL) / qpf.QuadPart);
+                SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, 0);
+                HANDLE h[2] = { hTimer, hInterrupt };
+                DWORD res = WaitForMultipleObjects(2, h, FALSE, INFINITE);
+                CancelWaitableTimer(hTimer);
+                if (res == WAIT_OBJECT_0 + 1) return false;    // interrupted
+            } else {
+                YieldProcessor();
+            }
         }
-        UnhookWindowsHookEx(hMouseHook);
-        hMouseHook = NULL;
-        g_pickingForSeq = false;
-        return 1; 
     }
-    return CallNextHookEx(NULL, nCode, wParam, lParam);
+};
+
+struct WinSink : InputSink {
+    void Send(const INPUT* in, int count) override { SendInput(count, (LPINPUT)in, sizeof(INPUT)); }
+    void MoveCursor(int x, int y) override { SetCursorPos(x, y); }
+};
+
+// ---------------------------------------------------------------- helpers
+static void SetText(HWND h, const std::wstring& s) { SetWindowTextW(h, s.c_str()); }
+static void SetInt(HWND h, int id, int v) { SetDlgItemInt(h, id, (UINT)v, TRUE); }
+static int  GetInt(HWND h, int id) { return (int)GetDlgItemInt(h, id, nullptr, TRUE); }
+static bool IsChecked(HWND h, int id) { return SendMessage(GetDlgItem(h, id), BM_GETCHECK, 0, 0) == BST_CHECKED; }
+static void SetChecked(HWND h, int id, bool on) { SendMessage(GetDlgItem(h, id), BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0); }
+static std::wstring GetText(HWND h, int id) {
+    wchar_t buf[2048] = {0};
+    GetDlgItemTextW(h, id, buf, 2048);
+    return buf;
+}
+static double GetDouble(HWND h, int id) {
+    std::wstring s = GetText(h, id);
+    for (wchar_t& ch : s) if (ch == L',') ch = L'.';
+    return wcstod(s.c_str(), nullptr);
+}
+static std::wstring Fmt(const wchar_t* f, ...) {
+    // MSVCRT's wide printf reads %s as a *narrow* string, which silently
+    // truncates wide arguments. Promote every %s to %ls.
+    std::wstring fmt(f);
+    for (size_t i = 0; i + 1 < fmt.size(); i++) {
+        if (fmt[i] == L'%') {
+            if (fmt[i + 1] == L'%') { i++; continue; }
+            if (fmt[i + 1] == L's') fmt[i + 1] = L'l';
+        }
+    }
+    wchar_t buf[512] = {0};
+    va_list ap; va_start(ap, f);
+    std::vswprintf(buf, 512, fmt.c_str(), ap);
+    va_end(ap);
+    return buf;
 }
 
-// Read floating point values from edit boxes (supports '.' and ',')
-double GetEditDouble(HWND hwnd, int id) {
-    char buf[64] = {0};
-    GetDlgItemTextA(hwnd, id, buf, sizeof(buf));
-    for (int i = 0; buf[i]; i++) {
-        if (buf[i] == ',') buf[i] = '.';
-    }
-    return atof(buf);
+// ---------------------------------------------------------------- ini (portable, next to the exe)
+static std::wstring IniPath() {
+    wchar_t path[MAX_PATH] = {0};
+    DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring p(path, n);
+    size_t slash = p.find_last_of(L'\\');
+    if (slash == std::wstring::npos) return L"UltimateAutoClicker.ini";
+    return p.substr(0, slash + 1) + L"UltimateAutoClicker.ini";
 }
 
-// Convert units, update edit boxes, and save interval when Enter is pressed
-void ConvertAndSaveInterval(HWND hwnd) {
-    if (g_isFormatting) return;
-    g_isFormatting = true;
+// the ini is plain UTF-8 so it stays readable and hand editable
+static std::wstring ReadFileText(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return L"";
+    std::string bytes;
+    char buf[4096];
+    DWORD n;
+    while (ReadFile(h, buf, 4096, &n, nullptr) && n) bytes.append(buf, n);
+    CloseHandle(h);
+    if (bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF && (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF)
+        bytes.erase(0, 3);                                  // strip BOM
+    if (bytes.empty()) return L"";
+    int nch = MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+    std::wstring out;
+    out.resize(nch);
+    MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), &out[0], nch);
+    return out;
+}
 
-    double h  = GetEditDouble(hwnd, ID_HRS);
-    double m  = GetEditDouble(hwnd, ID_MINS);
-    double s  = GetEditDouble(hwnd, ID_SECS);
-    double ms = GetEditDouble(hwnd, ID_MS);
-    double us = GetEditDouble(hwnd, ID_US);
+static bool WriteFileText(const std::wstring& path, const std::wstring& text) {
+    int nch = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    std::string bytes;
+    bytes.resize(nch);
+    if (nch) WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &bytes[0], nch, nullptr, nullptr);
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, bytes.data(), (DWORD)bytes.size(), &written, nullptr);
+    CloseHandle(h);
+    return ok && written == bytes.size();
+}
 
-    double totalUsD = (us) + (ms * 1000.0) + (s * 1000000.0) + (m * 60000000.0) + (h * 3600000000.0);
-    if (totalUsD < 0) totalUsD = 0;
+// section -> key -> value.  The [Settings] section values are joined with ';'
+// so a single blob can span several lines.
+static std::map<std::wstring, std::wstring> ReadIni(const std::wstring& path) {
+    std::map<std::wstring, std::wstring> out;
+    std::wstring text = ReadFileText(path);
+    std::wstring section = L"";
+    std::wstring joined;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find(L'\n', pos);
+        std::wstring line = text.substr(pos, nl == std::wstring::npos ? std::wstring::npos : nl - pos);
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        pos = (nl == std::wstring::npos) ? text.size() + 1 : nl + 1;
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+        if (line[0] == L'[') {
+            if (section == L"Settings" && !joined.empty()) out[L"Settings/config"] = joined;
+            joined.clear();
+            size_t e = line.find(L']');
+            section = (e == std::wstring::npos) ? L"" : line.substr(1, e - 1);
+            continue;
+        }
+        size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring key = line.substr(0, eq), val = line.substr(eq + 1);
+        if (section == L"Settings") {
+            if (!joined.empty()) joined += L";";
+            joined += key + L"=" + val;
+        } else {
+            out[section + L"/" + key] = val;
+        }
+    }
+    if (section == L"Settings" && !joined.empty()) out[L"Settings/config"] = joined;
+    return out;
+}
 
-    long long totalUs = (long long)(totalUsD + 0.5);
-    intervalUs = totalUs;
+static void SaveIni() {
+    std::wstring blob = EncodeConfig(g_cfg);
+    std::wstring out = L"[Settings]\r\n";
+    // one key per line: readable and still a single blob
+    size_t pos = 0;
+    while (pos < blob.size()) {
+        size_t sc = blob.find(L';', pos);
+        std::wstring part = blob.substr(pos, sc == std::wstring::npos ? std::wstring::npos : sc - pos);
+        if (!part.empty()) out += part + L"\r\n";
+        if (sc == std::wstring::npos) break;
+        pos = sc + 1;
+    }
+    out += L"\r\n[Profiles]\r\n";
+    out += Fmt(L"count=%d\r\n", (int)g_profiles.size());
+    for (size_t i = 0; i < g_profiles.size(); i++) {
+        out += Fmt(L"name_%d=%ls\r\n", (int)i, g_profiles[i].c_str());
+        auto it = g_profileData.find(g_profiles[i]);
+        if (it != g_profileData.end()) out += L"data_" + Fmt(L"%d", (int)i) + L"=" + it->second + L"\r\n";
+    }
+    WriteFileText(g_iniPath, out);
+}
 
-    long long outH  = totalUs / 3600000000LL;
-    long long rem1  = totalUs % 3600000000LL;
+static void LoadIni() {
+    std::map<std::wstring, std::wstring> ini = ReadIni(g_iniPath);
+    auto it = ini.find(L"Settings/config");
+    if (it != ini.end()) {
+        Config c;
+        if (DecodeConfig(it->second, c)) g_cfg = c;
+    }
+    g_profiles.clear();
+    g_profileData.clear();
+    for (size_t i = 0;; i++) {
+        auto n = ini.find(L"Profiles/name_" + Fmt(L"%d", (int)i));
+        if (n == ini.end()) break;
+        std::wstring name = n->second;
+        auto d = ini.find(L"Profiles/data_" + Fmt(L"%d", (int)i));
+        g_profiles.push_back(name);
+        if (d != ini.end()) g_profileData[name] = d->second;
+    }
+}
 
-    long long outM  = rem1 / 60000000LL;
-    long long rem2  = rem1 % 60000000LL;
+// ---------------------------------------------------------------- engine plumbing
+static void ApplyUiToConfig() {
+    g_cfg.intervalUs = ClampIntervalUs(FieldsToUs(
+        GetDouble(g_mainWnd, ID_HRS), GetDouble(g_mainWnd, ID_MINS), GetDouble(g_mainWnd, ID_SECS),
+        GetDouble(g_mainWnd, ID_MS), GetDouble(g_mainWnd, ID_US)));
+    g_cfg.randomize = IsChecked(g_mainWnd, ID_RAND_CHECK);
+    g_cfg.randMinUs = ClampIntervalUs((long long)(GetDouble(g_mainWnd, ID_RAND_MIN) * 1000.0));
+    g_cfg.randMaxUs = ClampIntervalUs((long long)(GetDouble(g_mainWnd, ID_RAND_MAX) * 1000.0));
+    if (g_cfg.randMaxUs < g_cfg.randMinUs) std::swap(g_cfg.randMinUs, g_cfg.randMaxUs);
 
-    long long outS  = rem2 / 1000000LL;
-    long long rem3  = rem2 % 1000000LL;
+    g_cfg.mouseBtn  = (int)SendMessage(GetDlgItem(g_mainWnd, ID_BTN_COMBO), CB_GETCURSEL, 0, 0);
+    g_cfg.clickType = (int)SendMessage(GetDlgItem(g_mainWnd, ID_TYPE_COMBO), CB_GETCURSEL, 0, 0);
+    g_cfg.clickMode = (int)SendMessage(GetDlgItem(g_mainWnd, ID_MODE_COMBO), CB_GETCURSEL, 0, 0);
+    g_cfg.action    = (int)SendMessage(GetDlgItem(g_mainWnd, ID_ACTION_COMBO), CB_GETCURSEL, 0, 0);
+    g_cfg.typeText  = GetText(g_mainWnd, ID_TEXT_EDIT);
 
-    long long outMs = rem3 / 1000LL;
-    long long outUs = rem3 % 1000LL;
+    g_cfg.maxClicks = IsChecked(g_mainWnd, ID_REP_TIMES) ? GetInt(g_mainWnd, ID_REP_COUNT) : 0;
+    if (g_cfg.maxClicks < 0) g_cfg.maxClicks = 0;
 
-    SetDlgItemInt(hwnd, ID_HRS,  (UINT)outH,  FALSE);
-    SetDlgItemInt(hwnd, ID_MINS, (UINT)outM,  FALSE);
-    SetDlgItemInt(hwnd, ID_SECS, (UINT)outS,  FALSE);
-    SetDlgItemInt(hwnd, ID_MS,   (UINT)outMs, FALSE);
-    SetDlgItemInt(hwnd, ID_US,   (UINT)outUs, FALSE);
+    if (IsChecked(g_mainWnd, ID_POS_CUST))      g_cfg.posMode = POS_FIXED;
+    else if (IsChecked(g_mainWnd, ID_POS_SEQ))  g_cfg.posMode = POS_SEQ;
+    else                                        g_cfg.posMode = POS_CURRENT;
+    g_cfg.targetX = GetInt(g_mainWnd, ID_POS_X);
+    g_cfg.targetY = GetInt(g_mainWnd, ID_POS_Y);
 
-    if (intervalUs < 5000) {
-        SetDlgItemTextA(hwnd, ID_WARN_STATIC, "[!] Warning: Interval is below 5 ms (< 200 CPS). Target app may lag.");
+    g_cfg.startDelaySec = GetInt(g_mainWnd, ID_DELAY_EDIT);
+    if (g_cfg.startDelaySec < 0) g_cfg.startDelaySec = 0;
+    if (g_cfg.startDelaySec > 300) g_cfg.startDelaySec = 300;
+    g_cfg.clickHoldUs = (long long)GetDouble(g_mainWnd, ID_HOLD_EDIT) * 1000.0;
+    g_cfg.alwaysOnTop = IsChecked(g_mainWnd, ID_TOP_CHECK);
+}
+
+static void ApplyConfigToUi() {
+    double h, m, s, ms, us;
+    UsToFields(g_cfg.intervalUs, h, m, s, ms, us);
+    SetDlgItemTextW(g_mainWnd, ID_HRS, Fmt(L"%.0f", h).c_str());
+    SetDlgItemTextW(g_mainWnd, ID_MINS, Fmt(L"%.0f", m).c_str());
+    SetDlgItemTextW(g_mainWnd, ID_SECS, Fmt(L"%.0f", s).c_str());
+    SetDlgItemTextW(g_mainWnd, ID_MS, Fmt(L"%.0f", ms).c_str());
+    SetDlgItemTextW(g_mainWnd, ID_US, Fmt(L"%.0f", us).c_str());
+
+    SetChecked(g_mainWnd, ID_RAND_CHECK, g_cfg.randomize);
+    SetDlgItemTextW(g_mainWnd, ID_RAND_MIN, Fmt(L"%.2f", (double)g_cfg.randMinUs / 1000.0).c_str());
+    SetDlgItemTextW(g_mainWnd, ID_RAND_MAX, Fmt(L"%.2f", (double)g_cfg.randMaxUs / 1000.0).c_str());
+
+    SendMessage(GetDlgItem(g_mainWnd, ID_BTN_COMBO), CB_SETCURSEL, g_cfg.mouseBtn, 0);
+    SendMessage(GetDlgItem(g_mainWnd, ID_TYPE_COMBO), CB_SETCURSEL, g_cfg.clickType, 0);
+    SendMessage(GetDlgItem(g_mainWnd, ID_MODE_COMBO), CB_SETCURSEL, g_cfg.clickMode, 0);
+    SendMessage(GetDlgItem(g_mainWnd, ID_ACTION_COMBO), CB_SETCURSEL, g_cfg.action, 0);
+    SetDlgItemTextW(g_mainWnd, ID_TEXT_EDIT, g_cfg.typeText.c_str());
+
+    SetChecked(g_mainWnd, ID_REP_INF, g_cfg.maxClicks == 0);
+    SetChecked(g_mainWnd, ID_REP_TIMES, g_cfg.maxClicks != 0);
+    SetInt(g_mainWnd, ID_REP_COUNT, g_cfg.maxClicks ? g_cfg.maxClicks : 10);
+
+    SetChecked(g_mainWnd, ID_POS_CUR, g_cfg.posMode == POS_CURRENT);
+    SetChecked(g_mainWnd, ID_POS_CUST, g_cfg.posMode == POS_FIXED);
+    SetChecked(g_mainWnd, ID_POS_SEQ, g_cfg.posMode == POS_SEQ);
+    SetInt(g_mainWnd, ID_POS_X, g_cfg.targetX);
+    SetInt(g_mainWnd, ID_POS_Y, g_cfg.targetY);
+
+    SetInt(g_mainWnd, ID_DELAY_EDIT, g_cfg.startDelaySec);
+    SetDlgItemTextW(g_mainWnd, ID_HOLD_EDIT, Fmt(L"%.0f", (double)g_cfg.clickHoldUs / 1000.0).c_str());
+    SetChecked(g_mainWnd, ID_TOP_CHECK, g_cfg.alwaysOnTop);
+
+    std::wstring hk = g_cfg.hotkey.empty() ? std::wstring(L"(none)") : g_cfg.hotkey.Name();
+    SetText(GetDlgItem(g_mainWnd, ID_HOTKEY_LABEL), L"Hotkey: " + hk);
+    SetWindowPos(g_mainWnd, g_cfg.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+}
+
+static void UpdateEnabledStates() {
+    int action = (int)SendMessage(GetDlgItem(g_mainWnd, ID_ACTION_COMBO), CB_GETCURSEL, 0, 0);
+    bool isClick = (action == ACT_CLICK);
+    EnableWindow(GetDlgItem(g_mainWnd, ID_BTN_COMBO), isClick);
+    EnableWindow(GetDlgItem(g_mainWnd, ID_TYPE_COMBO), isClick);
+    EnableWindow(GetDlgItem(g_mainWnd, ID_TEXT_EDIT), action == ACT_TYPE);
+    EnableWindow(GetDlgItem(g_mainWnd, ID_RAND_MIN), IsChecked(g_mainWnd, ID_RAND_CHECK));
+    EnableWindow(GetDlgItem(g_mainWnd, ID_RAND_MAX), IsChecked(g_mainWnd, ID_RAND_CHECK));
+}
+
+static void UpdateWarning() {
+    long long iv = g_cfg.intervalUs;
+    double cps = iv > 0 ? 1000000.0 / (double)iv : 0.0;
+    wchar_t buf[256];
+    if (g_cfg.randomize) {
+        double lo = (double)g_cfg.randMinUs / 1000.0, hi = (double)g_cfg.randMaxUs / 1000.0;
+        swprintf_s(buf, 256, L"Random interval: %.2f - %.2f ms  (%.0f - %.0f CPS)", lo, hi, 1000.0 / hi, 1000.0 / lo);
     } else {
-        SetDlgItemTextA(hwnd, ID_WARN_STATIC, "");
+        swprintf_s(buf, 256, L"Interval: %.3f ms  (%.2f CPS)", (double)iv / 1000.0, cps);
     }
-
-    g_isFormatting = false;
+    std::wstring warn;
+    if (!g_cfg.randomize && iv < 5000)
+        warn = std::wstring(L"[!] ") + buf + L"  -  below 5 ms, the target app may lag.";
+    else
+        warn = buf;
+    SetText(GetDlgItem(g_mainWnd, ID_WARN_STATIC), warn);
 }
 
-// Subclass procedure to catch Enter key inside edit controls
-LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+static void ConvertAndSaveInterval() {
+    ApplyUiToConfig();
+    double h, m, s, ms, us;
+    UsToFields(g_cfg.intervalUs, h, m, s, ms, us);
+    SetDlgItemTextW(g_mainWnd, ID_HRS, Fmt(L"%.0f", h).c_str());
+    SetDlgItemTextW(g_mainWnd, ID_MINS, Fmt(L"%.0f", m).c_str());
+    SetDlgItemTextW(g_mainWnd, ID_SECS, Fmt(L"%.0f", s).c_str());
+    SetDlgItemTextW(g_mainWnd, ID_MS, Fmt(L"%.0f", ms).c_str());
+    SetDlgItemTextW(g_mainWnd, ID_US, Fmt(L"%.0f", us).c_str());
+    UpdateWarning();
+    if (g_engine) g_engine->ApplyConfig(g_cfg);
+}
+
+// ---------------------------------------------------------------- hotkey helpers
+static bool IsModVk(int vk) {
+    switch (vk) {
+        case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+        case VK_SHIFT:   case VK_LSHIFT:   case VK_RSHIFT:
+        case VK_MENU:    case VK_LMENU:    case VK_RMENU:
+        case VK_LWIN:    case VK_RWIN:
+            return true;
+    }
+    return false;
+}
+static BYTE ModBit(int vk) {
+    switch (vk) {
+        case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: return MOD_CONTROL;
+        case VK_SHIFT:   case VK_LSHIFT:   case VK_RSHIFT:   return MOD_SHIFT;
+        case VK_MENU:    case VK_LMENU:    case VK_RMENU:    return MOD_ALT;
+        case VK_LWIN:    case VK_RWIN:                     return MOD_WIN;
+        default: return 0;
+    }
+}
+static bool VecHas(const std::vector<int>& v, int x) {
+    return std::find(v.begin(), v.end(), x) != v.end();
+}
+static void VecDel(std::vector<int>& v, int x) {
+    v.erase(std::remove(v.begin(), v.end(), x), v.end());
+}
+static bool OurWindowFocused() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+// ---------------------------------------------------------------- start / stop
+static void TimerResolutionOn() {
+    if (g_periodActive) return;
+    g_periodActive = true;
+    typedef MMRESULT (WINAPI *pfnTimeBeginPeriod)(UINT);
+    HMODULE w = LoadLibraryA("winmm.dll");
+    if (w) {
+        pfnTimeBeginPeriod f = (pfnTimeBeginPeriod)GetProcAddress(w, "timeBeginPeriod");
+        if (f) f(1);
+        FreeLibrary(w);
+    }
+}
+static void TimerResolutionOff() {
+    if (!g_periodActive) return;
+    g_periodActive = false;
+    typedef MMRESULT (WINAPI *pfnTimeEndPeriod)(UINT);
+    HMODULE w = LoadLibraryA("winmm.dll");
+    if (w) {
+        pfnTimeEndPeriod f = (pfnTimeEndPeriod)GetProcAddress(w, "timeEndPeriod");
+        if (f) f(1);
+        FreeLibrary(w);
+    }
+}
+
+static void ToggleClicking() {
+    if (!g_engine) return;
+    if (g_engine->IsRunning()) {
+        g_engine->Stop();
+        SetEvent(hInterrupt);
+    } else {
+        ApplyUiToConfig();
+        g_engine->ApplyConfig(g_cfg);
+        TimerResolutionOn();
+        g_engine->Start();
+        SetEvent(hWake);
+    }
+}
+
+static void UpdateButton() {
+    EngineStatus st = g_engine->Status();
+    std::wstring hk = g_cfg.hotkey.empty() ? std::wstring(L"(none)") : g_cfg.hotkey.Name();
+    std::wstring txt;
+    if (st.state == ST_COUNTDOWN) {
+        txt = Fmt(L"CANCEL - STARTING IN %d s", st.countdownSec);
+    } else if (st.state == ST_RUNNING) {
+        txt = Fmt(L"STOP CLICKING (%ls)", hk.c_str());
+    } else {
+        txt = Fmt(L"START CLICKING (%ls)", hk.c_str());
+    }
+    SetText(GetDlgItem(g_mainWnd, ID_MAIN_BTN), txt);
+}
+
+static void UpdateStats() {
+    EngineStatus st = g_engine->Status();
+    unsigned long long el = g_engine->ElapsedUs();
+    wchar_t buf[64];
+    swprintf_s(buf, 64, L"%d", st.clicksDone);
+    SetText(GetDlgItem(g_mainWnd, ID_STAT_CLICKS), L"Clicks: " + std::wstring(buf));
+    swprintf_s(buf, 64, L"%02llu:%02llu:%02llu", el / 3600000000ULL, (el / 60000000ULL) % 60, (el / 1000000ULL) % 60);
+    SetText(GetDlgItem(g_mainWnd, ID_STAT_TIME), L"Time: " + std::wstring(buf));
+    double cps = el > 0 ? (double)st.clicksDone * 1000000.0 / (double)el : 0.0;
+    swprintf_s(buf, 64, L"%.1f", cps);
+    SetText(GetDlgItem(g_mainWnd, ID_STAT_CPS), L"CPS: " + std::wstring(buf));
+
+    bool busy = st.state != ST_IDLE;
+    if (busy != g_lastBusy) {
+        g_lastBusy = busy;
+        if (!busy) TimerResolutionOff();
+    }
+}
+
+// ---------------------------------------------------------------- mouse hook
+static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN)) {
+        MSLLHOOKSTRUCT* m = (MSLLHOOKSTRUCT*)lParam;
+        if (m->dwExtraInfo != kInjectTag) {
+            if (g_pickMode == 1) {
+                PostMessage(g_mainWnd, WM_APP_PICK, (WPARAM)m->pt.x, (LPARAM)m->pt.y);
+                g_pickMode = 0;
+                return 1;                                    // swallow the picking click
+            }
+            if (g_pickMode == 2) {
+                HWND w = WindowFromPoint(m->pt);
+                DWORD pid = 0;
+                GetWindowThreadProcessId(w, &pid);
+                if (pid != GetCurrentProcessId())
+                    PostMessage(g_mainWnd, WM_APP_REC, (WPARAM)m->pt.x, (LPARAM)m->pt.y);
+            }
+        }
+    }
+    return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+}
+
+// ---------------------------------------------------------------- keyboard hook
+static void PreviewCombo(HWND dlg, const std::vector<int>& keys, BYTE mods, bool valid) {
+    Combo c; c.mods = mods; c.keys = keys;
+    std::wstring name = keys.empty() ? std::wstring(L"(press keys)") : c.Name();
+    SetText(GetDlgItem(dlg, 302), (valid ? L"Captured: " : L"Pressing: ") + name);
+}
+
+static int HandleKeyDown(KBDLLHOOKSTRUCT* k) {
+    int vk = (int)k->vkCode;
+    bool mod = IsModVk(vk);
+
+    if (g_capturing) {
+        if (mod) {
+            g_captureHeldMods |= ModBit(vk);
+        } else {
+            if (!VecHas(g_captureHeld, vk)) g_captureHeld.push_back(vk);
+        }
+        g_captureResult.mods = g_captureHeldMods;
+        g_captureResult.keys = g_captureHeld;
+        g_captureValid = !g_captureHeld.empty();
+        PreviewCombo(g_hotkeyDlg, g_captureHeld, g_captureHeldMods, false);
+        return 1;                                            // swallow while capturing
+    }
+
+    if (mod) { g_heldMods |= ModBit(vk); return 0; }
+    if (VecHas(g_pressedKeys, vk)) return 0;                 // auto repeat
+    g_pressedKeys.push_back(vk);
+
+    if (!g_hotkeyDlgOpen && !OurWindowFocused()) {
+        if (ComboMatches(g_cfg.hotkey, g_pressedKeys, g_heldMods)) {
+            g_pressedKeys.clear();
+            ToggleClicking();
+            return 1;                                        // swallow the trigger key
+        }
+    }
+    return 0;
+}
+
+static int HandleKeyUp(KBDLLHOOKSTRUCT* k) {
+    int vk = (int)k->vkCode;
+    bool mod = IsModVk(vk);
+
+    if (g_capturing) {
+        if (mod) {
+            g_captureHeldMods &= (BYTE)~ModBit(vk);
+        } else {
+            VecDel(g_captureHeld, vk);
+        }
+        if (g_captureHeld.empty() && g_captureHeldMods == 0) {
+            if (g_captureValid) {
+                PreviewCombo(g_hotkeyDlg, g_captureResult.keys, g_captureResult.mods, true);
+            }
+        } else {
+            PreviewCombo(g_hotkeyDlg, g_captureHeld, g_captureHeldMods, false);
+        }
+        return 1;
+    }
+
+    if (mod) { g_heldMods &= (BYTE)~ModBit(vk); return 0; }
+    VecDel(g_pressedKeys, vk);
+    return 0;
+}
+
+static LRESULT CALLBACK KbHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        KBDLLHOOKSTRUCT* k = (KBDLLHOOKSTRUCT*)lParam;
+        if (k->dwExtraInfo != kInjectTag) {
+            if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+                if (k->vkCode == VK_ESCAPE && (g_pickMode || g_capturing)) {
+                    if (g_capturing && g_hotkeyDlg) PostMessage(g_hotkeyDlg, WM_CLOSE, 0, 0);
+                    else PostMessage(g_mainWnd, WM_APP_STATE, 0, 0);   // cancel pick / recording
+                    return 1;
+                }
+                HandleKeyDown(k);
+            } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+                HandleKeyUp(k);
+            }
+        }
+    }
+    return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
+}
+
+// ---------------------------------------------------------------- worker thread
+static DWORD WINAPI ClickerThread(LPVOID) {
+    while (g_running) {
+        if (!g_engine->IsRunning()) {
+            WaitForSingleObject(hWake, 100);
+            continue;
+        }
+        g_engine->Tick();
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- tray
+static NOTIFYICONDATAW g_nid = {};
+static bool g_trayAdded = false;
+
+static void TrayAdd() {
+    if (g_trayAdded) return;
+    g_nid = {};
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = g_mainWnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_APP_TRAY;
+    g_nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APPICON));
+    wcscpy_s(g_nid.szTip, L"Ultimate AutoClicker");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    g_trayAdded = true;
+}
+static void TrayRemove() {
+    if (!g_trayAdded) return;
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    g_trayAdded = false;
+}
+static void ShowTrayMenu() {
+    POINT pt; GetCursorPos(&pt);
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, 9001, L"Show / Hide");
+    AppendMenuW(m, MF_STRING, 9002, g_engine && g_engine->IsRunning() ? L"Stop Clicking" : L"Start Clicking");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 9003, L"Exit");
+    SetForegroundWindow(g_mainWnd);
+    UINT cmd = (UINT)TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, g_mainWnd, nullptr);
+    DestroyMenu(m);
+    if (cmd == 9001) {
+        if (IsWindowVisible(g_mainWnd)) ShowWindow(g_mainWnd, SW_HIDE);
+        else { ShowWindow(g_mainWnd, SW_SHOW); SetForegroundWindow(g_mainWnd); }
+    } else if (cmd == 9002) {
+        ToggleClicking();
+    } else if (cmd == 9003) {
+        DestroyWindow(g_mainWnd);
+    }
+}
+
+// ---------------------------------------------------------------- hotkey dialog
+static LRESULT CALLBACK HotkeyModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            g_hotkeyDlg = hwnd;
+            g_capturing = true;
+            g_captureHeld.clear();
+            g_captureHeldMods = 0;
+            g_captureResult = Combo();
+            g_captureValid = false;
+
+            HWND l1 = CreateWindowExW(0, L"STATIC", L"Press the key combination you want to use.",
+                WS_VISIBLE | WS_CHILD, 15, 12, 290, 20, hwnd, nullptr, nullptr, nullptr);
+            SendMessage(l1, WM_SETFONT, (WPARAM)g_font, TRUE);
+            HWND l2 = CreateWindowExW(0, L"STATIC", L"(press keys)",
+                WS_VISIBLE | WS_CHILD, 15, 38, 290, 22, hwnd, (HMENU)302, nullptr, nullptr);
+            SendMessage(l2, WM_SETFONT, (WPARAM)g_bold, TRUE);
+            HWND l3 = CreateWindowExW(0, L"STATIC", L"Modifiers + one key, or several keys held together (X + Z).",
+                WS_VISIBLE | WS_CHILD, 15, 64, 290, 18, hwnd, nullptr, nullptr, nullptr);
+            SendMessage(l3, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+            HWND b1 = CreateWindowExW(0, L"BUTTON", L"Save", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP,
+                50, 92, 105, 30, hwnd, (HMENU)IDOK, nullptr, nullptr);
+            SendMessage(b1, WM_SETFONT, (WPARAM)g_bold, TRUE);
+            HWND b2 = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
+                165, 92, 105, 30, hwnd, (HMENU)IDCANCEL, nullptr, nullptr);
+            SendMessage(b2, WM_SETFONT, (WPARAM)g_font, TRUE);
+            SetFocus(hwnd);
+            break;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            if (id == IDOK) {
+                if (g_captureValid) {
+                    Combo c = g_captureResult;
+                    if (!c.keys.empty()) {
+                        g_cfg.hotkey = c;
+                        ApplyUiToConfig();
+                        if (g_engine) g_engine->ApplyConfig(g_cfg);
+                        std::wstring hk = c.Name();
+                        SetText(GetDlgItem(g_mainWnd, ID_HOTKEY_LABEL), L"Hotkey: " + hk);
+                        UpdateButton();
+                    }
+                }
+                g_capturing = false;
+                g_hotkeyDlgOpen = false;
+                EnableWindow(g_mainWnd, TRUE);
+                SetForegroundWindow(g_mainWnd);
+                DestroyWindow(hwnd);
+            } else if (id == IDCANCEL) {
+                g_capturing = false;
+                g_hotkeyDlgOpen = false;
+                EnableWindow(g_mainWnd, TRUE);
+                SetForegroundWindow(g_mainWnd);
+                DestroyWindow(hwnd);
+            }
+            break;
+        }
+        case WM_CLOSE:
+            g_capturing = false;
+            g_hotkeyDlgOpen = false;
+            EnableWindow(g_mainWnd, TRUE);
+            SetForegroundWindow(g_mainWnd);
+            DestroyWindow(hwnd);
+            break;
+        case WM_CTLCOLORSTATIC: {
+            SetBkMode((HDC)wParam, TRANSPARENT);
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        default: return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- points dialog
+static unsigned long long g_recLastUs = 0;
+
+static void RefreshSeqList(HWND hList) {
+    SendMessage(hList, LB_RESETCONTENT, 0, 0);
+    wchar_t buf[128];
+    for (int i = 0; i < (int)g_cfg.seq.size(); i++) {
+        const SeqPoint& p = g_cfg.seq[i];
+        if (p.delayUs >= 0)
+            swprintf_s(buf, 128, L"#%d:  (X: %d,  Y: %d)   +%.0f ms", i + 1, p.x, p.y, (double)p.delayUs / 1000.0);
+        else
+            swprintf_s(buf, 128, L"#%d:  (X: %d,  Y: %d)", i + 1, p.x, p.y);
+        SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)buf);
+    }
+    SendMessageW(GetDlgItem(g_mainWnd, ID_SEQ_BTN), WM_SETTEXT, 0, (LPARAM)Fmt(L"Manage Points (%d)...", (int)g_cfg.seq.size()).c_str());
+}
+
+static LRESULT CALLBACK SeqModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            g_seqDlg = hwnd;
+            g_seqDlgOpen = true;
+            HWND l0 = CreateWindowExW(0, L"STATIC", L"Click points (recorded or manual):",
+                WS_VISIBLE | WS_CHILD, 15, 10, 300, 18, hwnd, nullptr, nullptr, nullptr);
+            SendMessage(l0, WM_SETFONT, (WPARAM)g_bold, TRUE);
+
+            HWND hList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
+                WS_VISIBLE | WS_CHILD | WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP, 15, 30, 300, 130, hwnd, (HMENU)ID_SEQ_LIST, nullptr, nullptr);
+            SendMessage(hList, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+            HWND bRec = CreateWindowExW(0, L"BUTTON", L"Record clicks...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
+                15, 168, 140, 26, hwnd, (HMENU)ID_SEQ_REC_BTN, nullptr, nullptr);
+            SendMessage(bRec, WM_SETFONT, (WPARAM)g_bold, TRUE);
+            HWND bDel = CreateWindowExW(0, L"BUTTON", L"Delete Selected", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
+                163, 168, 152, 26, hwnd, (HMENU)ID_SEQ_DEL_BTN, nullptr, nullptr);
+            SendMessage(bDel, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+            HWND lx = CreateWindowExW(0, L"STATIC", L"X:", WS_VISIBLE | WS_CHILD, 15, 206, 15, 20, hwnd, nullptr, nullptr, nullptr);
+            SendMessage(lx, WM_SETFONT, (WPARAM)g_font, TRUE);
+            HWND hX = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_CENTER | WS_TABSTOP,
+                32, 203, 48, 23, hwnd, (HMENU)ID_SEQ_IN_X, nullptr, nullptr);
+            SendMessage(hX, WM_SETFONT, (WPARAM)g_font, TRUE);
+            HWND ly = CreateWindowExW(0, L"STATIC", L"Y:", WS_VISIBLE | WS_CHILD, 90, 206, 15, 20, hwnd, nullptr, nullptr, nullptr);
+            SendMessage(ly, WM_SETFONT, (WPARAM)g_font, TRUE);
+            HWND hY = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_CENTER | WS_TABSTOP,
+                107, 203, 48, 23, hwnd, (HMENU)ID_SEQ_IN_Y, nullptr, nullptr);
+            SendMessage(hY, WM_SETFONT, (WPARAM)g_font, TRUE);
+            HWND ld = CreateWindowExW(0, L"STATIC", L"Delay ms:", WS_VISIBLE | WS_CHILD, 165, 206, 55, 20, hwnd, nullptr, nullptr, nullptr);
+            SendMessage(ld, WM_SETFONT, (WPARAM)g_font, TRUE);
+            HWND hD = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_CENTER | WS_TABSTOP,
+                222, 203, 48, 23, hwnd, (HMENU)ID_SEQ_IN_D, nullptr, nullptr);
+            SendMessage(hD, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+            HWND bAdd = CreateWindowExW(0, L"BUTTON", L"Add", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
+                275, 202, 55, 25, hwnd, (HMENU)ID_SEQ_ADD_BTN, nullptr, nullptr);
+            SendMessage(bAdd, WM_SETFONT, (WPARAM)g_font, TRUE);
+            HWND bClr = CreateWindowExW(0, L"BUTTON", L"Clear All", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
+                15, 235, 95, 25, hwnd, (HMENU)ID_SEQ_CLR_BTN, nullptr, nullptr);
+            SendMessage(bClr, WM_SETFONT, (WPARAM)g_font, TRUE);
+            HWND bDone = CreateWindowExW(0, L"BUTTON", L"Done", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP,
+                120, 235, 115, 28, hwnd, (HMENU)IDOK, nullptr, nullptr);
+            SendMessage(bDone, WM_SETFONT, (WPARAM)g_bold, TRUE);
+
+            RefreshSeqList(hList);
+            break;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            HWND hList = GetDlgItem(hwnd, ID_SEQ_LIST);
+            int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+
+            if (id == ID_SEQ_ADD_BTN) {
+                SeqPoint p;
+                p.x = (int)GetDlgItemInt(hwnd, ID_SEQ_IN_X, nullptr, TRUE);
+                p.y = (int)GetDlgItemInt(hwnd, ID_SEQ_IN_Y, nullptr, TRUE);
+                wchar_t dbuf[32] = {0};
+                GetDlgItemTextW(hwnd, ID_SEQ_IN_D, dbuf, 32);
+                p.delayUs = dbuf[0] ? (long long)wcstod(dbuf, nullptr) * 1000.0 : -1;
+                g_cfg.seq.push_back(p);
+                RefreshSeqList(hList);
+            } else if (id == ID_SEQ_DEL_BTN) {
+                if (sel != LB_ERR && sel < (int)g_cfg.seq.size()) {
+                    g_cfg.seq.erase(g_cfg.seq.begin() + sel);
+                    RefreshSeqList(hList);
+                }
+            } else if (id == ID_SEQ_CLR_BTN) {
+                g_cfg.seq.clear();
+                g_recLastUs = 0;
+                RefreshSeqList(hList);
+            } else if (id == ID_SEQ_REC_BTN) {
+                if (g_pickMode == 2) {
+                    g_pickMode = 0;
+                    if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+                    SetDlgItemTextW(hwnd, ID_SEQ_REC_BTN, L"Record clicks...");
+                } else {
+                    g_pickMode = 2;
+                    g_recLastUs = 0;
+                    g_cfg.seq.clear();
+                    RefreshSeqList(hList);
+                    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, GetModuleHandleW(nullptr), 0);
+                    SetDlgItemTextW(hwnd, ID_SEQ_REC_BTN, L"Stop recording (ESC)");
+                }
+            } else if (id == IDOK || id == IDCANCEL) {
+                if (g_pickMode == 2) {
+                    g_pickMode = 0;
+                    if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+                }
+                g_seqDlgOpen = false;
+                EnableWindow(g_mainWnd, TRUE);
+                SetForegroundWindow(g_mainWnd);
+                DestroyWindow(hwnd);
+            }
+            break;
+        }
+        case WM_APP_REC: {
+            // a click was captured while recording
+            unsigned long long now = g_clock ? g_clock->NowUs() : 0;
+            SeqPoint p;
+            p.x = (int)wParam; p.y = (int)lParam;
+            p.delayUs = g_recLastUs ? (long long)(now - g_recLastUs) : 0;
+            g_recLastUs = now;
+            g_cfg.seq.push_back(p);
+            RefreshSeqList(GetDlgItem(hwnd, ID_SEQ_LIST));
+            break;
+        }
+        case WM_CLOSE:
+            if (g_pickMode == 2) {
+                g_pickMode = 0;
+                if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+            }
+            g_seqDlgOpen = false;
+            EnableWindow(g_mainWnd, TRUE);
+            SetForegroundWindow(g_mainWnd);
+            DestroyWindow(hwnd);
+            break;
+        case WM_CTLCOLORSTATIC: {
+            SetBkMode((HDC)wParam, TRANSPARENT);
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        default: return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- enter key in the interval boxes
+static LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+                                         UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     switch (uMsg) {
         case WM_GETDLGCODE:
             if (wParam == VK_RETURN) return DLGC_WANTALLKEYS;
             break;
         case WM_KEYDOWN:
-            if (wParam == VK_RETURN) {
-                HWND hMain = (HWND)dwRefData;
-                ConvertAndSaveInterval(hMain);
-                return 0;
-            }
+            if (wParam == VK_RETURN) { ConvertAndSaveInterval(); return 0; }
             break;
         case WM_CHAR:
-            if (wParam == VK_RETURN) return 0; // Suppress beep
+            if (wParam == VK_RETURN) return 0;
             break;
         case WM_NCDESTROY:
             RemoveWindowSubclass(hWnd, EditSubclassProc, uIdSubclass);
@@ -169,707 +874,615 @@ LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
-void RefreshSeqList(HWND hList) {
-    SendMessage(hList, LB_RESETCONTENT, 0, 0);
-    char itemBuf[64];
-    for (int i = 0; i < seqCount; i++) {
-        wsprintfA(itemBuf, "#%d:  (X: %d,  Y: %d)", i + 1, seqPoints[i].x, seqPoints[i].y);
-        SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)itemBuf);
-    }
-    char btnBuf[64];
-    wsprintfA(btnBuf, "Manage Points (%d)...", seqCount);
-    SetDlgItemTextA(hMainWnd, ID_SEQ_BTN, btnBuf);
+// ---------------------------------------------------------------- main window
+static void BuildUi(HWND hwnd) {
+    auto Add = [&](LPCWSTR cls, LPCWSTR txt, DWORD style, int x, int y, int w, int h, int id, HFONT f = nullptr) {
+        HWND c = CreateWindowExW(0, cls, txt, WS_VISIBLE | WS_CHILD | style, x, y, w, h, hwnd,
+                                 (HMENU)(UINT_PTR)id, nullptr, nullptr);
+        SendMessage(c, WM_SETFONT, (WPARAM)(f ? f : g_font), TRUE);
+        return c;
+    };
+
+    // --- click interval
+    Add(L"BUTTON", L"Click Interval", BS_GROUPBOX, 10, 8, 480, 76, 0);
+    Add(L"STATIC", L"Hrs", 0, 20, 30, 26, 20, 0);
+    HWND hHrs = Add(L"EDIT", L"0", WS_BORDER | WS_TABSTOP | ES_CENTER, 48, 27, 38, 22, ID_HRS);
+    Add(L"STATIC", L"Mins", 0, 94, 30, 30, 20, 0);
+    HWND hMins = Add(L"EDIT", L"0", WS_BORDER | WS_TABSTOP | ES_CENTER, 126, 27, 38, 22, ID_MINS);
+    Add(L"STATIC", L"Secs", 0, 172, 30, 30, 20, 0);
+    HWND hSecs = Add(L"EDIT", L"0", WS_BORDER | WS_TABSTOP | ES_CENTER, 204, 27, 38, 22, ID_SECS);
+    Add(L"STATIC", L"Ms", 0, 250, 30, 22, 20, 0);
+    HWND hMs = Add(L"EDIT", L"100", WS_BORDER | WS_TABSTOP | ES_CENTER, 274, 27, 44, 22, ID_MS);
+    Add(L"STATIC", L"\xB5s", 0, 326, 30, 20, 20, 0);
+    HWND hUs = Add(L"EDIT", L"0", WS_BORDER | WS_TABSTOP | ES_CENTER, 348, 27, 50, 22, ID_US);
+    SetWindowSubclass(hHrs, EditSubclassProc, 1, (DWORD_PTR)hwnd);
+    SetWindowSubclass(hMins, EditSubclassProc, 1, (DWORD_PTR)hwnd);
+    SetWindowSubclass(hSecs, EditSubclassProc, 1, (DWORD_PTR)hwnd);
+    SetWindowSubclass(hMs, EditSubclassProc, 1, (DWORD_PTR)hwnd);
+    SetWindowSubclass(hUs, EditSubclassProc, 1, (DWORD_PTR)hwnd);
+    Add(L"STATIC", L"", 0, 16, 56, 470, 18, ID_WARN_STATIC);
+
+    // --- randomisation
+    Add(L"BUTTON", L"Randomisation", BS_GROUPBOX, 10, 90, 480, 48, 0);
+    HWND hRand = Add(L"BUTTON", L"Random interval", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 108, 140, 20, ID_RAND_CHECK);
+    (void)hRand;
+    Add(L"STATIC", L"Min (ms)", 0, 170, 108, 58, 20, 0);
+    Add(L"EDIT", L"50", WS_BORDER | WS_TABSTOP | ES_CENTER, 230, 105, 60, 23, ID_RAND_MIN);
+    Add(L"STATIC", L"Max (ms)", 0, 298, 108, 58, 20, 0);
+    Add(L"EDIT", L"150", WS_BORDER | WS_TABSTOP | ES_CENTER, 358, 105, 60, 23, ID_RAND_MAX);
+
+    // --- click options
+    Add(L"BUTTON", L"Click Options", BS_GROUPBOX, 10, 144, 480, 55, 0);
+    Add(L"STATIC", L"Mouse Button:", 0, 22, 162, 95, 20, 0);
+    HWND hBtnCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP, 118, 158, 95, 120, ID_BTN_COMBO);
+    Add(L"STATIC", L"Type:", 0, 222, 162, 40, 20, 0);
+    HWND hTypeCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP, 264, 158, 90, 120, ID_TYPE_COMBO);
+    Add(L"STATIC", L"Mode:", 0, 362, 162, 42, 20, 0);
+    HWND hModeCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP, 406, 158, 78, 120, ID_MODE_COMBO);
+    SendMessageW(hBtnCombo, CB_ADDSTRING, 0, (LPARAM)L"Left");
+    SendMessageW(hBtnCombo, CB_ADDSTRING, 0, (LPARAM)L"Right");
+    SendMessageW(hBtnCombo, CB_ADDSTRING, 0, (LPARAM)L"Middle");
+    SendMessageW(hTypeCombo, CB_ADDSTRING, 0, (LPARAM)L"Single");
+    SendMessageW(hTypeCombo, CB_ADDSTRING, 0, (LPARAM)L"Double");
+    SendMessageW(hModeCombo, CB_ADDSTRING, 0, (LPARAM)L"Repeat");
+    SendMessageW(hModeCombo, CB_ADDSTRING, 0, (LPARAM)L"Hold");
+    SendMessageW(hModeCombo, CB_ADDSTRING, 0, (LPARAM)L"Single");
+    SendMessage(hBtnCombo, CB_SETCURSEL, 0, 0);
+    SendMessage(hTypeCombo, CB_SETCURSEL, 0, 0);
+    SendMessage(hModeCombo, CB_SETCURSEL, 0, 0);
+
+    // --- action
+    Add(L"BUTTON", L"Action", BS_GROUPBOX, 10, 205, 480, 55, 0);
+    Add(L"STATIC", L"Action:", 0, 22, 223, 52, 20, 0);
+    HWND hActCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP, 76, 219, 145, 120, ID_ACTION_COMBO);
+    SendMessageW(hActCombo, CB_ADDSTRING, 0, (LPARAM)L"Click");
+    SendMessageW(hActCombo, CB_ADDSTRING, 0, (LPARAM)L"Scroll Up");
+    SendMessageW(hActCombo, CB_ADDSTRING, 0, (LPARAM)L"Scroll Down");
+    SendMessageW(hActCombo, CB_ADDSTRING, 0, (LPARAM)L"Type Text");
+    SendMessage(hActCombo, CB_SETCURSEL, 0, 0);
+    Add(L"STATIC", L"Text:", 0, 228, 223, 40, 20, 0);
+    Add(L"EDIT", L"Hello", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 270, 219, 214, 23, ID_TEXT_EDIT);
+
+    // --- repeat
+    Add(L"BUTTON", L"Click Repeat", BS_GROUPBOX, 10, 266, 480, 48, 0);
+    Add(L"BUTTON", L"Repeat until stopped", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 22, 284, 155, 20, ID_REP_INF);
+    Add(L"BUTTON", L"Repeat", BS_AUTORADIOBUTTON, 205, 284, 55, 20, ID_REP_TIMES);
+    Add(L"STATIC", L"times", 0, 263, 284, 36, 20, 0);
+    Add(L"EDIT", L"10", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 302, 282, 60, 23, ID_REP_COUNT);
+
+    // --- cursor position
+    Add(L"BUTTON", L"Cursor Position", BS_GROUPBOX, 10, 320, 480, 105, 0);
+    Add(L"BUTTON", L"Current Location", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 22, 338, 125, 20, ID_POS_CUR);
+    Add(L"BUTTON", L"Specific Location", BS_AUTORADIOBUTTON, 22, 364, 115, 20, ID_POS_CUST);
+    Add(L"STATIC", L"X:", 0, 145, 364, 16, 20, 0);
+    Add(L"EDIT", L"0", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 163, 362, 48, 23, ID_POS_X);
+    Add(L"STATIC", L"Y:", 0, 219, 364, 16, 20, 0);
+    Add(L"EDIT", L"0", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 237, 362, 48, 23, ID_POS_Y);
+    Add(L"BUTTON", L"Pick Location", BS_PUSHBUTTON | WS_TABSTOP, 295, 360, 80, 26, ID_PICK_BTN);
+    Add(L"BUTTON", L"Consecutive Points", BS_AUTORADIOBUTTON, 22, 392, 140, 20, ID_POS_SEQ);
+    Add(L"BUTTON", L"Manage Points (0)...", BS_PUSHBUTTON | WS_TABSTOP, 170, 390, 190, 26, ID_SEQ_BTN);
+
+    // --- timing
+    Add(L"BUTTON", L"Timing", BS_GROUPBOX, 10, 431, 480, 48, 0);
+    Add(L"STATIC", L"Start delay:", 0, 22, 449, 78, 20, 0);
+    Add(L"EDIT", L"3", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 102, 446, 45, 23, ID_DELAY_EDIT);
+    Add(L"STATIC", L"sec", 0, 152, 449, 30, 20, 0);
+    Add(L"STATIC", L"Hold:", 0, 200, 449, 38, 20, 0);
+    Add(L"EDIT", L"10", WS_BORDER | WS_TABSTOP | ES_CENTER, 240, 446, 50, 23, ID_HOLD_EDIT);
+    Add(L"STATIC", L"ms", 0, 294, 449, 26, 20, 0);
+    Add(L"STATIC", L"(button down time)", 0, 326, 449, 150, 20, 0);
+
+    // --- hotkey
+    Add(L"BUTTON", L"Hotkey", BS_GROUPBOX, 10, 485, 480, 48, 0);
+    Add(L"STATIC", L"Hotkey: F6", 0, 22, 503, 240, 20, ID_HOTKEY_LABEL, g_bold);
+    Add(L"BUTTON", L"Change Hotkey...", BS_PUSHBUTTON | WS_TABSTOP, 320, 499, 150, 26, ID_CHANGE_HOTKEY_BTN);
+
+    // --- profiles
+    Add(L"BUTTON", L"Profiles", BS_GROUPBOX, 10, 539, 480, 48, 0);
+    HWND hProfCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWN | WS_TABSTOP | ES_AUTOHSCROLL, 22, 557, 200, 120, ID_PROF_COMBO);
+    (void)hProfCombo;
+    Add(L"BUTTON", L"Save", BS_PUSHBUTTON | WS_TABSTOP, 228, 555, 66, 25, ID_PROF_SAVE);
+    Add(L"BUTTON", L"Load", BS_PUSHBUTTON | WS_TABSTOP, 300, 555, 66, 25, ID_PROF_LOAD);
+    Add(L"BUTTON", L"Delete", BS_PUSHBUTTON | WS_TABSTOP, 372, 555, 96, 25, ID_PROF_DEL);
+
+    // --- status
+    Add(L"STATIC", L"Clicks: 0", 0, 12, 592, 140, 20, ID_STAT_CLICKS);
+    Add(L"STATIC", L"Time: 00:00:00", 0, 160, 592, 140, 20, ID_STAT_TIME);
+    Add(L"STATIC", L"CPS: 0.0", 0, 310, 592, 140, 20, ID_STAT_CPS);
+    Add(L"BUTTON", L"Always on Top", BS_AUTOCHECKBOX | WS_TABSTOP, 12, 614, 130, 20, ID_TOP_CHECK);
+    Add(L"BUTTON", L"START CLICKING (F6)", BS_PUSHBUTTON | WS_TABSTOP, 10, 640, 480, 46, ID_MAIN_BTN, g_bold);
+
+    SendMessage(GetDlgItem(hwnd, ID_REP_INF), BM_SETCHECK, BST_CHECKED, 0);
+    SendMessage(GetDlgItem(hwnd, ID_POS_CUR), BM_SETCHECK, BST_CHECKED, 0);
 }
 
-// Modal Dialog Procedure for Consecutive Clicks Sequence
-LRESULT CALLBACK SeqModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+static void RefreshProfileCombo() {
+    HWND c = GetDlgItem(g_mainWnd, ID_PROF_COMBO);
+    SendMessage(c, CB_RESETCONTENT, 0, 0);
+    for (size_t i = 0; i < g_profiles.size(); i++)
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)g_profiles[i].c_str());
+}
+
+static void CenterOn(HWND hwnd, int w, int h) {
+    RECT rc; GetWindowRect(g_mainWnd, &rc);
+    int x = rc.left + ((rc.right - rc.left) - w) / 2;
+    int y = rc.top + ((rc.bottom - rc.top) - h) / 2;
+    SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
-            hSeqModalWnd = hwnd;
-            HFONT f = CreateFontA(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, "Segoe UI");
-            HFONT fBold = CreateFontA(14, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, "Segoe UI");
-
-            HWND hLbl = CreateWindowExA(0, "STATIC", "Consecutive Locations Queue:", WS_VISIBLE | WS_CHILD, 15, 10, 290, 18, hwnd, NULL, NULL, NULL);
-            SendMessage(hLbl, WM_SETFONT, (WPARAM)fBold, TRUE);
-
-            HWND hList = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", NULL, WS_VISIBLE | WS_CHILD | WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP, 15, 30, 295, 120, hwnd, (HMENU)ID_SEQ_LIST, NULL, NULL);
-            SendMessage(hList, WM_SETFONT, (WPARAM)f, TRUE);
-
-            HWND hPickBtn = CreateWindowExA(0, "BUTTON", "Pick from Screen...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, 15, 160, 140, 26, hwnd, (HMENU)ID_SEQ_PICK_BTN, NULL, NULL);
-            SendMessage(hPickBtn, WM_SETFONT, (WPARAM)fBold, TRUE);
-
-            HWND hDelBtn = CreateWindowExA(0, "BUTTON", "Delete Selected", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, 165, 160, 145, 26, hwnd, (HMENU)ID_SEQ_DEL_BTN, NULL, NULL);
-            SendMessage(hDelBtn, WM_SETFONT, (WPARAM)f, TRUE);
-
-            HWND hLblX = CreateWindowExA(0, "STATIC", "X:", WS_VISIBLE | WS_CHILD, 15, 198, 15, 20, hwnd, NULL, NULL, NULL);
-            SendMessage(hLblX, WM_SETFONT, (WPARAM)f, TRUE);
-            HWND hInX = CreateWindowExA(0, "EDIT", "0", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER | ES_CENTER | WS_TABSTOP, 32, 196, 45, 22, hwnd, (HMENU)ID_SEQ_IN_X, NULL, NULL);
-            SendMessage(hInX, WM_SETFONT, (WPARAM)f, TRUE);
-
-            HWND hLblY = CreateWindowExA(0, "STATIC", "Y:", WS_VISIBLE | WS_CHILD, 85, 198, 15, 20, hwnd, NULL, NULL, NULL);
-            SendMessage(hLblY, WM_SETFONT, (WPARAM)f, TRUE);
-            HWND hInY = CreateWindowExA(0, "EDIT", "0", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER | ES_CENTER | WS_TABSTOP, 102, 196, 45, 22, hwnd, (HMENU)ID_SEQ_IN_Y, NULL, NULL);
-            SendMessage(hInY, WM_SETFONT, (WPARAM)f, TRUE);
-
-            HWND hAddBtn = CreateWindowExA(0, "BUTTON", "Add (X, Y)", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, 155, 195, 80, 24, hwnd, (HMENU)ID_SEQ_ADD_BTN, NULL, NULL);
-            SendMessage(hAddBtn, WM_SETFONT, (WPARAM)f, TRUE);
-
-            HWND hClrBtn = CreateWindowExA(0, "BUTTON", "Clear All", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, 242, 195, 68, 24, hwnd, (HMENU)ID_SEQ_CLR_BTN, NULL, NULL);
-            SendMessage(hClrBtn, WM_SETFONT, (WPARAM)f, TRUE);
-
-            HWND hDoneBtn = CreateWindowExA(0, "BUTTON", "Done", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 105, 238, 115, 28, hwnd, (HMENU)IDOK, NULL, NULL);
-            SendMessage(hDoneBtn, WM_SETFONT, (WPARAM)fBold, TRUE);
-
-            RefreshSeqList(hList);
+            g_mainWnd = hwnd;
+            BuildUi(hwnd);
+            ApplyConfigToUi();
+            UpdateEnabledStates();
+            UpdateWarning();
+            UpdateButton();
+            RefreshProfileCombo();
+            TrayAdd();
+            SetTimer(hwnd, 1, 100, nullptr);
             break;
         }
+        case WM_TIMER: {
+            UpdateButton();
+            UpdateStats();
+            break;
+        }
+        case WM_APP_STATE: {
+            // ESC: cancel a pick or a hotkey capture
+            if (g_pickMode == 1) {
+                g_pickMode = 0;
+                if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+                ShowWindow(g_mainWnd, SW_SHOW);
+                SetForegroundWindow(g_mainWnd);
+            } else if (g_pickMode == 2) {
+                g_pickMode = 0;
+                if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+                if (g_seqDlg) SetDlgItemTextW(g_seqDlg, ID_SEQ_REC_BTN, L"Record clicks...");
+            } else if (g_capturing) {
+                g_capturing = false;
+                if (g_hotkeyDlg) DestroyWindow(g_hotkeyDlg);
+            }
+            break;
+        }
+        case WM_APP_PICK: {
+            if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+            ShowWindow(g_mainWnd, SW_SHOW);
+            SetForegroundWindow(g_mainWnd);
+            SetInt(hwnd, ID_POS_X, (int)wParam);
+            SetInt(hwnd, ID_POS_Y, (int)lParam);
+            SetChecked(hwnd, ID_POS_CUST, true);
+            SetChecked(hwnd, ID_POS_CUR, false);
+            SetChecked(hwnd, ID_POS_SEQ, false);
+            g_cfg.posMode = POS_FIXED;
+            g_cfg.targetX = (int)wParam;
+            g_cfg.targetY = (int)lParam;
+            break;
+        }
+        case WM_APP_TRAY: {
+            if (lParam == WM_RBUTTONUP) ShowTrayMenu();
+            else if (lParam == WM_LBUTTONDBLCLK) { ShowWindow(g_mainWnd, SW_SHOW); SetForegroundWindow(g_mainWnd); }
+            break;
+        }
+        case WM_SIZE:
+            if (wParam == SIZE_MINIMIZED) ShowWindow(hwnd, SW_HIDE);
+            break;
         case WM_COMMAND: {
             int id = LOWORD(wParam);
-            HWND hList = GetDlgItem(hwnd, ID_SEQ_LIST);
-            if (id == ID_SEQ_PICK_BTN) {
-                g_pickingForSeq = true;
-                ShowWindow(hwnd, SW_HIDE);
-                ShowWindow(hMainWnd, SW_HIDE);
-                hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookProc, GetModuleHandle(NULL), 0);
-            }
-            if (id == ID_SEQ_ADD_BTN) {
-                if (seqCount < 2048) {
-                    seqPoints[seqCount].x = GetDlgItemInt(hwnd, ID_SEQ_IN_X, NULL, TRUE);
-                    seqPoints[seqCount].y = GetDlgItemInt(hwnd, ID_SEQ_IN_Y, NULL, TRUE);
-                    seqCount = seqCount + 1;
-                    RefreshSeqList(hList);
-                    SendMessage(GetDlgItem(hMainWnd, ID_POS_SEQ), BM_SETCHECK, BST_CHECKED, 0);
-                    SendMessage(GetDlgItem(hMainWnd, ID_POS_CUR), BM_SETCHECK, BST_UNCHECKED, 0);
-                    SendMessage(GetDlgItem(hMainWnd, ID_POS_CUST), BM_SETCHECK, BST_UNCHECKED, 0);
+            switch (id) {
+                case ID_MAIN_BTN: ToggleClicking(); break;
+                case ID_PICK_BTN: {
+                    g_pickMode = 1;
+                    ShowWindow(hwnd, SW_HIDE);
+                    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, GetModuleHandleW(nullptr), 0);
+                    break;
                 }
-            }
-            if (id == ID_SEQ_DEL_BTN) {
-                int sel = SendMessage(hList, LB_GETCURSEL, 0, 0);
-                if (sel != LB_ERR && sel < seqCount) {
-                    for (int i = sel; i < seqCount - 1; i++) {
-                        seqPoints[i] = seqPoints[i + 1];
+                case ID_SEQ_BTN: {
+                    if (g_engine && g_engine->IsRunning()) { g_engine->Stop(); SetEvent(hInterrupt); }
+                    EnableWindow(hwnd, FALSE);
+                    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"SeqModalClass", L"Manage Consecutive Clicks",
+                        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE, 0, 0, 340, 275, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                    CenterOn(dlg, 340, 275);
+                    break;
+                }
+                case ID_CHANGE_HOTKEY_BTN: {
+                    if (g_engine && g_engine->IsRunning()) { g_engine->Stop(); SetEvent(hInterrupt); }
+                    EnableWindow(hwnd, FALSE);
+                    g_hotkeyDlgOpen = true;
+                    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"HotkeyModalClass", L"Change Hotkey",
+                        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE, 0, 0, 320, 140, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                    CenterOn(dlg, 320, 140);
+                    break;
+                }
+                case ID_TOP_CHECK: {
+                    bool on = IsChecked(hwnd, ID_TOP_CHECK);
+                    g_cfg.alwaysOnTop = on;
+                    SetWindowPos(hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                    break;
+                }
+                case ID_ACTION_COMBO: UpdateEnabledStates(); break;
+                case ID_RAND_CHECK: UpdateEnabledStates(); break;
+                case ID_HRS: case ID_MINS: case ID_SECS: case ID_MS: case ID_US:
+                    ApplyUiToConfig();
+                    UpdateWarning();
+                    break;
+                case ID_PROF_SAVE: {
+                    wchar_t name[128] = {0};
+                    GetDlgItemTextW(hwnd, ID_PROF_COMBO, name, 128);
+                    std::wstring n = name;
+                    if (n.empty()) { MessageBoxW(hwnd, L"Type a name for the profile first.", L"Profiles", MB_ICONINFORMATION); break; }
+                    ApplyUiToConfig();
+                    g_profileData[n] = EncodeConfig(g_cfg);
+                    bool exists = false;
+                    for (size_t i = 0; i < g_profiles.size(); i++) if (g_profiles[i] == n) exists = true;
+                    if (!exists) g_profiles.push_back(n);
+                    RefreshProfileCombo();
+                    SendMessageW(GetDlgItem(hwnd, ID_PROF_COMBO), CB_SELECTSTRING, (WPARAM)-1, (LPARAM)n.c_str());
+                    SaveIni();
+                    break;
+                }
+                case ID_PROF_LOAD: {
+                    int sel = (int)SendMessage(GetDlgItem(hwnd, ID_PROF_COMBO), CB_GETCURSEL, 0, 0);
+                    if (sel >= 0 && sel < (int)g_profiles.size()) {
+                        auto it = g_profileData.find(g_profiles[sel]);
+                        if (it != g_profileData.end()) {
+                            Config c;
+                            if (DecodeConfig(it->second, c)) {
+                                g_cfg = c;
+                                ApplyConfigToUi();
+                                UpdateEnabledStates();
+                                UpdateWarning();
+                                UpdateButton();
+                                if (g_engine) g_engine->ApplyConfig(g_cfg);
+                            }
+                        }
                     }
-                    seqCount = seqCount - 1;
-                    RefreshSeqList(hList);
+                    break;
                 }
-            }
-            if (id == ID_SEQ_CLR_BTN) {
-                seqCount = 0;
-                RefreshSeqList(hList);
-            }
-            if (id == IDOK || id == IDCANCEL) {
-                hSeqModalWnd = NULL;
-                EnableWindow(hMainWnd, TRUE);
-                SetForegroundWindow(hMainWnd);
-                DestroyWindow(hwnd);
-            }
-            break;
-        }
-        case WM_USER + 3: {
-            if (seqCount < 2048) {
-                seqPoints[seqCount].x = (int)wParam;
-                seqPoints[seqCount].y = (int)lParam;
-                seqCount = seqCount + 1;
-                RefreshSeqList(GetDlgItem(hwnd, ID_SEQ_LIST));
-                SendMessage(GetDlgItem(hMainWnd, ID_POS_SEQ), BM_SETCHECK, BST_CHECKED, 0);
-                SendMessage(GetDlgItem(hMainWnd, ID_POS_CUR), BM_SETCHECK, BST_UNCHECKED, 0);
-                SendMessage(GetDlgItem(hMainWnd, ID_POS_CUST), BM_SETCHECK, BST_UNCHECKED, 0);
-            }
-            ShowWindow(hMainWnd, SW_SHOW);
-            ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
-            break;
-        }
-        case WM_CLOSE: {
-            hSeqModalWnd = NULL;
-            EnableWindow(hMainWnd, TRUE);
-            SetForegroundWindow(hMainWnd);
-            DestroyWindow(hwnd);
-            break;
-        }
-        case WM_CTLCOLORSTATIC: {
-            SetBkMode((HDC)wParam, TRANSPARENT);
-            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
-        }
-        default: return DefWindowProc(hwnd, msg, wParam, lParam);
-    }
-    return 0;
-}
-
-// Modal Dialog Procedure for Changing Hotkey
-LRESULT CALLBACK HotkeyModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-        case WM_CREATE: {
-            HFONT f = CreateFontA(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, "Segoe UI");
-            HFONT fBold = CreateFontA(15, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, "Segoe UI");
-
-            HWND hText = CreateWindowExA(0, "STATIC", "Press keys on your keyboard:", WS_VISIBLE | WS_CHILD, 15, 15, 270, 20, hwnd, NULL, NULL, NULL);
-            SendMessage(hText, WM_SETFONT, (WPARAM)f, TRUE);
-
-            HWND hHkCtrl = CreateWindowExA(0, HOTKEY_CLASSA, NULL, WS_VISIBLE | WS_CHILD | WS_BORDER | WS_TABSTOP, 15, 40, 275, 28, hwnd, (HMENU)301, NULL, NULL);
-            SendMessage(hHkCtrl, WM_SETFONT, (WPARAM)fBold, TRUE);
-            SendMessage(hHkCtrl, HKM_SETHOTKEY, currentHkVal, 0);
-            SendMessage(hHkCtrl, HKM_SETRULES, HKCOMB_NONE, 0);
-
-            HWND hBtnSave = CreateWindowExA(0, "BUTTON", "Save Hotkey", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON | WS_TABSTOP, 50, 85, 110, 30, hwnd, (HMENU)IDOK, NULL, NULL);
-            SendMessage(hBtnSave, WM_SETFONT, (WPARAM)fBold, TRUE);
-
-            HWND hBtnCancel = CreateWindowExA(0, "BUTTON", "Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, 170, 85, 120, 30, hwnd, (HMENU)IDCANCEL, NULL, NULL);
-            SendMessage(hBtnCancel, WM_SETFONT, (WPARAM)f, TRUE);
-
-            SetFocus(hHkCtrl);
-            break;
-        }
-        case WM_COMMAND: {
-            int id = LOWORD(wParam);
-            if (id == IDOK) {
-                HWND hHkCtrl = GetDlgItem(hwnd, 301);
-                LRESULT hk = SendMessage(hHkCtrl, HKM_GETHOTKEY, 0, 0);
-                UINT vkey = LOBYTE(hk), mods = HIBYTE(hk), regMods = 0;
-
-                if (mods & HOTKEYF_ALT) regMods |= MOD_ALT;
-                if (mods & HOTKEYF_CONTROL) regMods |= MOD_CONTROL;
-                if (mods & HOTKEYF_SHIFT) regMods |= MOD_SHIFT;
-
-                if (vkey != 0) {
-                    UnregisterHotKey(hMainWnd, 1);
-                    if (RegisterHotKey(hMainWnd, 1, regMods, vkey)) {
-                        currentHkVal = (WORD)hk;
-                        FormatHotkeyName(currentHkVal, currentHotkeyName, sizeof(currentHotkeyName));
-
-                        char lblBuf[128], btnText[128];
-                        wsprintfA(lblBuf, "Current Hotkey: %s", currentHotkeyName);
-                        SetDlgItemTextA(hMainWnd, ID_HOTKEY_LABEL, lblBuf);
-
-                        wsprintfA(btnText, clicking ? "STOP CLICKING (%s)" : "START CLICKING (%s)", currentHotkeyName);
-                        SetWindowTextA(GetDlgItem(hMainWnd, ID_MAIN_BTN), btnText);
-
-                        EnableWindow(hMainWnd, TRUE);
-                        SetForegroundWindow(hMainWnd);
-                        DestroyWindow(hwnd);
-                    } else {
-                        // Re-register previous hotkey on error
-                        UINT prevVk = LOBYTE(currentHkVal), prevMods = HIBYTE(currentHkVal), prevReg = 0;
-                        if (prevMods & HOTKEYF_ALT) prevReg |= MOD_ALT;
-                        if (prevMods & HOTKEYF_CONTROL) prevReg |= MOD_CONTROL;
-                        if (prevMods & HOTKEYF_SHIFT) prevReg |= MOD_SHIFT;
-                        RegisterHotKey(hMainWnd, 1, prevReg, prevVk);
-
-                        MessageBoxA(hwnd, "Failed to register hotkey. It might be in use by another application.", "Hotkey In Use", MB_ICONERROR);
+                case ID_PROF_DEL: {
+                    int sel = (int)SendMessage(GetDlgItem(hwnd, ID_PROF_COMBO), CB_GETCURSEL, 0, 0);
+                    if (sel >= 0 && sel < (int)g_profiles.size()) {
+                        g_profileData.erase(g_profiles[sel]);
+                        g_profiles.erase(g_profiles.begin() + sel);
+                        RefreshProfileCombo();
+                        SaveIni();
                     }
+                    break;
                 }
-            }
-            if (id == IDCANCEL) {
-                EnableWindow(hMainWnd, TRUE);
-                SetForegroundWindow(hMainWnd);
-                DestroyWindow(hwnd);
-            }
-            break;
-        }
-        case WM_CLOSE: {
-            EnableWindow(hMainWnd, TRUE);
-            SetForegroundWindow(hMainWnd);
-            DestroyWindow(hwnd);
-            break;
-        }
-        case WM_CTLCOLORSTATIC: {
-            SetBkMode((HDC)wParam, TRANSPARENT);
-            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
-        }
-        default: return DefWindowProc(hwnd, msg, wParam, lParam);
-    }
-    return 0;
-}
-
-// Hardware-synced absolute timestamp wait routine
-void WaitUntilQpc(LONGLONG targetQpc, LONGLONG qpf) {
-    if (!running || !clicking) return;
-
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (now.QuadPart >= targetQpc) return;
-
-    LONGLONG remainingTicks = targetQpc - now.QuadPart;
-    LONGLONG coarseThreshold = (2000LL * qpf) / 1000000LL;
-
-    if (remainingTicks > coarseThreshold) {
-        LONGLONG coarseTicks = remainingTicks - (1500LL * qpf) / 1000000LL;
-        if (hTimerHandle) {
-            LARGE_INTEGER liDueTime;
-            liDueTime.QuadPart = -((coarseTicks * 10000000LL) / qpf);
-            SetWaitableTimer(hTimerHandle, &liDueTime, 0, NULL, NULL, 0);
-
-            HANDLE handles[2] = { hTimerHandle, hClickEvent };
-            DWORD res = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-            CancelWaitableTimer(hTimerHandle);
-            if (res == WAIT_OBJECT_0 + 1 || !clicking || !running) {
-                return;
-            }
-        } else {
-            DWORD coarseMs = (DWORD)((coarseTicks * 1000LL) / qpf);
-            if (coarseMs > 0) {
-                if (WaitForSingleObject(hClickEvent, coarseMs) != WAIT_TIMEOUT) {
-                    return;
-                }
-            }
-        }
-    }
-
-    while (running && clicking) {
-        QueryPerformanceCounter(&now);
-        if (now.QuadPart >= targetQpc) break;
-        YieldProcessor();
-    }
-}
-
-DWORD WINAPI ClickerThread(LPVOID lpParam) {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-
-    DWORD_PTR processAffinity = 0, systemAffinity = 0;
-    if (GetProcessAffinityMask(GetCurrentProcess(), &processAffinity, &systemAffinity) && processAffinity) {
-        DWORD_PTR primaryCore = processAffinity & (~processAffinity + 1);
-        SetThreadAffinityMask(GetCurrentThread(), primaryCore);
-    }
-
-    LARGE_INTEGER qpf;
-    QueryPerformanceFrequency(&qpf);
-
-    while (running) {
-        if (!clicking) {
-            WaitForSingleObject(hClickEvent, INFINITE);
-        }
-        if (!running) break;
-
-        DWORD downFlag = MOUSEEVENTF_LEFTDOWN, upFlag = MOUSEEVENTF_LEFTUP;
-        if (mouseBtn == 1) { downFlag = MOUSEEVENTF_RIGHTDOWN; upFlag = MOUSEEVENTF_RIGHTUP; }
-        else if (mouseBtn == 2) { downFlag = MOUSEEVENTF_MIDDLEDOWN; upFlag = MOUSEEVENTF_MIDDLEUP; }
-
-        ULONG_PTR extraInfo = GetMessageExtraInfo();
-
-        LARGE_INTEGER qpcStart;
-        QueryPerformanceCounter(&qpcStart);
-        LONGLONG nextClickQpc = qpcStart.QuadPart;
-
-        while (running && clicking) {
-            if (maxClicks > 0 && clicksDone >= maxClicks) {
-                clicking = false;
-                PostMessage(hMainWnd, WM_USER + 1, 0, 0); 
-                break;
-            }
-
-            int clickX = 0, clickY = 0;
-            bool usePos = false;
-
-            if (posMode == 1) {
-                clickX = targetX;
-                clickY = targetY;
-                usePos = true;
-            } else if (posMode == 2 && seqCount > 0) {
-                int curIdx = seqIndex % seqCount;
-                clickX = seqPoints[curIdx].x;
-                clickY = seqPoints[curIdx].y;
-                usePos = true;
-                seqIndex = (seqIndex + 1) % seqCount;
-            }
-
-            INPUT inputs[2] = { 0 };
-            inputs[0].type = INPUT_MOUSE;
-            inputs[0].mi.dwExtraInfo = extraInfo;
-            inputs[1].type = INPUT_MOUSE;
-            inputs[1].mi.dwExtraInfo = extraInfo;
-
-            if (usePos) {
-                SetCursorPos(clickX, clickY);
-
-                int vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                int vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                int vWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-                int vHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-
-                LONG normX = (LONG)(((clickX - vLeft) * 65535LL) / (vWidth > 1 ? vWidth - 1 : 1));
-                LONG normY = (LONG)(((clickY - vTop) * 65535LL) / (vHeight > 1 ? vHeight - 1 : 1));
-
-                inputs[0].mi.dx = normX;
-                inputs[0].mi.dy = normY;
-                inputs[0].mi.dwFlags = downFlag | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
-
-                inputs[1].mi.dx = normX;
-                inputs[1].mi.dy = normY;
-                inputs[1].mi.dwFlags = upFlag | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
-            } else {
-                inputs[0].mi.dx = 0;
-                inputs[0].mi.dy = 0;
-                inputs[0].mi.dwFlags = downFlag;
-
-                inputs[1].mi.dx = 0;
-                inputs[1].mi.dy = 0;
-                inputs[1].mi.dwFlags = upFlag;
-            }
-
-            long long curInterval = intervalUs;
-            LONGLONG intervalTicks = (curInterval * qpf.QuadPart) / 1000000LL;
-            LONGLONG clickBaseQpc = nextClickQpc;
-
-            if (curInterval <= 1000) {
-                SendInput(2, inputs, sizeof(INPUT));
-                if (clickType == 1) {
-                    SendInput(2, inputs, sizeof(INPUT));
-                }
-            } else {
-                long long holdUs = (curInterval >= 40000) ? 10000 : (curInterval / 4);
-                LONGLONG holdTicks = (holdUs * qpf.QuadPart) / 1000000LL;
-
-                SendInput(1, &inputs[0], sizeof(INPUT));
-                if (holdTicks > 0) WaitUntilQpc(clickBaseQpc + holdTicks, qpf.QuadPart);
-                SendInput(1, &inputs[1], sizeof(INPUT));
-
-                if (clickType == 1) {
-                    long long pauseUs = (curInterval >= 40000) ? 10000 : (curInterval / 4);
-                    LONGLONG pauseTicks = (pauseUs * qpf.QuadPart) / 1000000LL;
-                    LONGLONG secondDownQpc = clickBaseQpc + holdTicks + pauseTicks;
-                    WaitUntilQpc(secondDownQpc, qpf.QuadPart);
-
-                    SendInput(1, &inputs[0], sizeof(INPUT));
-                    if (holdTicks > 0) WaitUntilQpc(secondDownQpc + holdTicks, qpf.QuadPart);
-                    SendInput(1, &inputs[1], sizeof(INPUT));
-                }
-            }
-
-            clicksDone = clicksDone + 1;
-
-            if (!running || !clicking) break;
-
-            nextClickQpc += intervalTicks;
-
-            LARGE_INTEGER qpcNow;
-            QueryPerformanceCounter(&qpcNow);
-
-            if (nextClickQpc > qpcNow.QuadPart) {
-                WaitUntilQpc(nextClickQpc, qpf.QuadPart);
-            } else if (intervalTicks > 0 && (qpcNow.QuadPart - nextClickQpc > intervalTicks)) {
-                nextClickQpc = qpcNow.QuadPart;
-            }
-        }
-    }
-    return 0;
-}
-
-// Safely stop the auto-clicker
-void StopClicking() {
-    if (clicking) {
-        clicking = false;
-        char btnText[128];
-        wsprintfA(btnText, "START CLICKING (%s)", currentHotkeyName);
-        SetWindowTextA(GetDlgItem(hMainWnd, ID_MAIN_BTN), btnText);
-        ResetEvent(hClickEvent);
-        SetEvent(hClickEvent);
-    }
-}
-
-void ToggleClicking() {
-    if (!clicking) {
-        ConvertAndSaveInterval(hMainWnd);
-
-        clicking = true;
-
-        mouseBtn = SendMessage(GetDlgItem(hMainWnd, ID_BTN_COMBO), CB_GETCURSEL, 0, 0);
-        clickType = SendMessage(GetDlgItem(hMainWnd, ID_TYPE_COMBO), CB_GETCURSEL, 0, 0);
-
-        bool isInfinite = SendMessage(GetDlgItem(hMainWnd, ID_REP_INF), BM_GETCHECK, 0, 0) == BST_CHECKED;
-        maxClicks = isInfinite ? 0 : GetDlgItemInt(hMainWnd, ID_REP_COUNT, 0, 0);
-        clicksDone = 0;
-
-        if (SendMessage(GetDlgItem(hMainWnd, ID_POS_CUST), BM_GETCHECK, 0, 0) == BST_CHECKED) {
-            posMode = 1;
-            targetX = GetDlgItemInt(hMainWnd, ID_POS_X, 0, 1);
-            targetY = GetDlgItemInt(hMainWnd, ID_POS_Y, 0, 1);
-        } else if (SendMessage(GetDlgItem(hMainWnd, ID_POS_SEQ), BM_GETCHECK, 0, 0) == BST_CHECKED) {
-            posMode = 2;
-            seqIndex = 0;
-        } else {
-            posMode = 0;
-        }
-
-        char btnText[128];
-        wsprintfA(btnText, "STOP CLICKING (%s)", currentHotkeyName);
-        SetWindowTextA(GetDlgItem(hMainWnd, ID_MAIN_BTN), btnText);
-        SetEvent(hClickEvent); 
-    } else {
-        StopClicking();
-    }
-}
-
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-        case WM_CREATE: {
-            hMainWnd = hwnd;
-            hFont = CreateFontA(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, "Segoe UI");
-            hBold = CreateFontA(16, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, "Segoe UI");
-
-            auto AddCtrl = [&](LPCSTR cls, LPCSTR txt, DWORD style, int x, int y, int w, int h, int id, HFONT f = hFont) {
-                HWND hCtrl = CreateWindowExA(0, cls, txt, WS_VISIBLE | WS_CHILD | style, x, y, w, h, hwnd, (HMENU)(UINT_PTR)id, NULL, NULL);
-                SendMessage(hCtrl, WM_SETFONT, (WPARAM)f, TRUE);
-                return hCtrl;
-            };
-
-            AddCtrl("BUTTON", "Click Interval", BS_GROUPBOX, 10, 10, 365, 55, 0);
-            AddCtrl("STATIC", "Hrs", 0, 18, 33, 24, 20, 0);    
-            HWND hHrs  = AddCtrl("EDIT", "0", WS_BORDER | WS_TABSTOP | ES_CENTER, 44, 30, 30, 20, ID_HRS);
-            AddCtrl("STATIC", "Mins", 0, 80, 33, 30, 20, 0);   
-            HWND hMins = AddCtrl("EDIT", "0", WS_BORDER | WS_TABSTOP | ES_CENTER, 112, 30, 30, 20, ID_MINS);
-            AddCtrl("STATIC", "Secs", 0, 148, 33, 28, 20, 0);  
-            HWND hSecs = AddCtrl("EDIT", "0", WS_BORDER | WS_TABSTOP | ES_CENTER, 178, 30, 30, 20, ID_SECS);
-            AddCtrl("STATIC", "Ms", 0, 214, 33, 20, 20, 0);    
-            HWND hMs   = AddCtrl("EDIT", "100", WS_BORDER | WS_TABSTOP | ES_CENTER, 236, 30, 45, 20, ID_MS);
-            AddCtrl("STATIC", "\xB5s", 0, 287, 33, 18, 20, 0);  
-            HWND hUs   = AddCtrl("EDIT", "0", WS_BORDER | WS_TABSTOP | ES_CENTER, 307, 30, 55, 20, ID_US);
-
-            // Subclass all 5 interval edit controls to catch Enter key
-            SetWindowSubclass(hHrs,  EditSubclassProc, 1, (DWORD_PTR)hwnd);
-            SetWindowSubclass(hMins, EditSubclassProc, 1, (DWORD_PTR)hwnd);
-            SetWindowSubclass(hSecs, EditSubclassProc, 1, (DWORD_PTR)hwnd);
-            SetWindowSubclass(hMs,   EditSubclassProc, 1, (DWORD_PTR)hwnd);
-            SetWindowSubclass(hUs,   EditSubclassProc, 1, (DWORD_PTR)hwnd);
-
-            AddCtrl("STATIC", "", 0, 15, 68, 355, 18, ID_WARN_STATIC);
-
-            AddCtrl("BUTTON", "Click Options", BS_GROUPBOX, 10, 88, 365, 60, 0);
-            AddCtrl("STATIC", "Mouse Button:", 0, 25, 113, 90, 20, 0);
-            HWND hBtnCombo = AddCtrl("COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, 120, 108, 80, 100, ID_BTN_COMBO);
-            AddCtrl("STATIC", "Type:", 0, 220, 113, 40, 20, 0);
-            HWND hTypeCombo = AddCtrl("COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, 260, 108, 95, 100, ID_TYPE_COMBO);
-            
-            SendMessageA(hBtnCombo, CB_ADDSTRING, 0, (LPARAM)"Left"); SendMessageA(hBtnCombo, CB_ADDSTRING, 0, (LPARAM)"Right"); SendMessageA(hBtnCombo, CB_ADDSTRING, 0, (LPARAM)"Middle");
-            SendMessageA(hTypeCombo, CB_ADDSTRING, 0, (LPARAM)"Single"); SendMessageA(hTypeCombo, CB_ADDSTRING, 0, (LPARAM)"Double");
-            SendMessageA(hBtnCombo, CB_SETCURSEL, 0, 0); SendMessageA(hTypeCombo, CB_SETCURSEL, 0, 0);
-
-            AddCtrl("BUTTON", "Click Repeat", BS_GROUPBOX, 10, 158, 365, 80, 0);
-            HWND hRad1 = AddCtrl("BUTTON", "Repeat until stopped", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 25, 178, 150, 20, ID_REP_INF);
-            AddCtrl("BUTTON", "Repeat           times", BS_AUTORADIOBUTTON, 25, 208, 150, 20, ID_REP_TIMES);
-            AddCtrl("EDIT", "10", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 90, 208, 45, 20, ID_REP_COUNT);
-            SendMessage(hRad1, BM_SETCHECK, BST_CHECKED, 0);
-
-            AddCtrl("BUTTON", "Cursor Position", BS_GROUPBOX, 10, 248, 365, 105, 0);
-            HWND hPos1 = AddCtrl("BUTTON", "Current Location", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 25, 268, 130, 20, ID_POS_CUR);
-            AddCtrl("BUTTON", "Specific Location", BS_AUTORADIOBUTTON, 25, 295, 120, 20, ID_POS_CUST);
-            AddCtrl("STATIC", "X:", 0, 148, 295, 15, 20, 0); AddCtrl("EDIT", "0", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 165, 294, 38, 20, ID_POS_X);
-            AddCtrl("STATIC", "Y:", 0, 208, 295, 15, 20, 0); AddCtrl("EDIT", "0", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 223, 294, 38, 20, ID_POS_Y);
-            AddCtrl("BUTTON", "Pick Location", BS_PUSHBUTTON | WS_TABSTOP, 266, 292, 100, 24, ID_PICK_BTN);
-            AddCtrl("BUTTON", "Consecutive Points", BS_AUTORADIOBUTTON, 25, 323, 145, 20, ID_POS_SEQ);
-            AddCtrl("BUTTON", "Manage Points (0)...", BS_PUSHBUTTON | WS_TABSTOP, 175, 321, 191, 25, ID_SEQ_BTN);
-            SendMessage(hPos1, BM_SETCHECK, BST_CHECKED, 0);
-
-            AddCtrl("BUTTON", "Start / Stop Hotkey", BS_GROUPBOX, 10, 360, 365, 60, 0);
-            AddCtrl("STATIC", "Current Hotkey: F6", 0, 25, 382, 180, 20, ID_HOTKEY_LABEL, hBold);
-            AddCtrl("BUTTON", "Change Hotkey...", BS_PUSHBUTTON | WS_TABSTOP, 215, 378, 145, 28, ID_CHANGE_HOTKEY_BTN);
-
-            AddCtrl("BUTTON", "Always on Top", BS_AUTOCHECKBOX | WS_TABSTOP, 15, 427, 120, 20, ID_TOP_CHECK);
-            
-            AddCtrl("BUTTON", "START CLICKING (F6)", BS_PUSHBUTTON | WS_TABSTOP, 10, 452, 365, 45, ID_MAIN_BTN, hBold);
-
-            RegisterHotKey(hwnd, 1, 0, VK_F6);
-            break;
-        }
-        case WM_HOTKEY: {
-            // Ignore hotkeys while modal dialog is open / main window is disabled
-            if (wParam == 1 && IsWindowEnabled(hwnd)) {
-                ToggleClicking();
-            }
-            break;
-        }
-        case WM_USER + 1: ToggleClicking(); break; 
-        
-        case WM_USER + 2: {
-            SetDlgItemInt(hwnd, ID_POS_X, (int)wParam, TRUE);
-            SetDlgItemInt(hwnd, ID_POS_Y, (int)lParam, TRUE);
-            SendMessage(GetDlgItem(hwnd, ID_POS_CUST), BM_SETCHECK, BST_CHECKED, 0);
-            SendMessage(GetDlgItem(hwnd, ID_POS_CUR), BM_SETCHECK, BST_UNCHECKED, 0);
-            SendMessage(GetDlgItem(hwnd, ID_POS_SEQ), BM_SETCHECK, BST_UNCHECKED, 0);
-            ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
-            break;
-        }
-        
-        case WM_COMMAND: {
-            int id = LOWORD(wParam);
-
-            if (id == ID_MAIN_BTN) { ToggleClicking(); SetFocus(hwnd); }
-            if (id == ID_PICK_BTN) {
-                g_pickingForSeq = false;
-                ShowWindow(hwnd, SW_HIDE);
-                hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookProc, GetModuleHandle(NULL), 0);
-            }
-            if (id == ID_SEQ_BTN) {
-                StopClicking();
-                EnableWindow(hwnd, FALSE);
-
-                RECT rcMain;
-                GetWindowRect(hwnd, &rcMain);
-                int modalW = 340, modalH = 320;
-                int modalX = rcMain.left + (rcMain.right - rcMain.left - modalW) / 2;
-                int modalY = rcMain.top + (rcMain.bottom - rcMain.top - modalH) / 2;
-
-                hSeqModalWnd = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, "SeqModalClass", "Manage Consecutive Clicks",
-                    WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-                    modalX, modalY, modalW, modalH, hwnd, NULL, GetModuleHandle(NULL), NULL);
-            }
-            if (id == ID_TOP_CHECK) {
-                bool isTop = SendMessage((HWND)lParam, BM_GETCHECK, 0, 0);
-                SetWindowPos(hwnd, isTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            }
-            if (id == ID_CHANGE_HOTKEY_BTN) {
-                StopClicking(); // Automatically disable the autoclicker if running!
-
-                EnableWindow(hwnd, FALSE);
-
-                RECT rcMain;
-                GetWindowRect(hwnd, &rcMain);
-                int modalW = 310, modalH = 165;
-                int modalX = rcMain.left + (rcMain.right - rcMain.left - modalW) / 2;
-                int modalY = rcMain.top + (rcMain.bottom - rcMain.top - modalH) / 2;
-
-                HWND hModal = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, "HotkeyModalClass", "Change Hotkey",
-                    WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-                    modalX, modalY, modalW, modalH, hwnd, NULL, GetModuleHandle(NULL), NULL);
+                default: break;
             }
             break;
         }
         case WM_CTLCOLORSTATIC: {
             if ((HWND)lParam == GetDlgItem(hwnd, ID_WARN_STATIC)) {
-                HDC hdcStatic = (HDC)wParam;
-                SetTextColor(hdcStatic, RGB(200, 30, 30));
-                SetBkMode(hdcStatic, TRANSPARENT);
+                SetTextColor((HDC)wParam, RGB(200, 30, 30));
+                SetBkMode((HDC)wParam, TRANSPARENT);
                 return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
             }
             SetBkMode((HDC)wParam, TRANSPARENT);
             return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
         }
-        case WM_DESTROY: { 
-            running = false; 
-            if (hMouseHook) UnhookWindowsHookEx(hMouseHook);
-            UnregisterHotKey(hwnd, 1); 
-            if (hFont) DeleteObject(hFont);
-            if (hBold) DeleteObject(hBold);
-
-            if (hTimerHandle) {
-                CloseHandle(hTimerHandle);
-                hTimerHandle = NULL;
-            }
-
-            if (hNtdll) {
-                FreeLibrary(hNtdll);
-            }
-
-            if (hWinmm) {
-                pfnTimeEndPeriod pTimeEndPeriod = (pfnTimeEndPeriod)GetProcAddress(hWinmm, "timeEndPeriod");
-                if (pTimeEndPeriod) pTimeEndPeriod(1);
-                FreeLibrary(hWinmm);
-            }
-
-            PostQuitMessage(0); 
-            break; 
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            break;
+        case WM_DESTROY: {
+            g_running = false;
+            if (g_engine && g_engine->IsRunning()) { g_engine->Stop(); SetEvent(hInterrupt); }
+            KillTimer(hwnd, 1);
+            TrayRemove();
+            if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
+            if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+            SaveIni();
+            PostQuitMessage(0);
+            break;
         }
         default: return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     return 0;
 }
 
+// ---------------------------------------------------------------- self test
+// Drives the real window with the real engine, so the GUI wiring is covered too.
+static int g_selfChecks = 0, g_selfFails = 0;
+
+static void SelfTestLog(const char* fmt, ...) {
+    char buf[1024];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) { fputs(buf, stdout); fflush(stdout); }
+}
+
+// Keeps the window alive while the test waits: the timer that updates the
+// button text and the stats only runs while messages are pumped.
+static void PumpMessages(int ms) {
+    DWORD end = GetTickCount() + (DWORD)ms;
+    MSG msg;
+    while (GetTickCount() < end) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(10);
+    }
+}
+#define ST_CHECK(cond, name) do { g_selfChecks++; if (!(cond)) { g_selfFails++; \
+    SelfTestLog("  FAIL  %s\n", name); } } while (0)
+
+static std::wstring CtlText(HWND h, int id) {
+    wchar_t buf[512] = {0};
+    GetDlgItemTextW(h, id, buf, 512);
+    return buf;
+}
+
+static int RunSelfTest(HWND hwnd) {
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        FILE* f = nullptr;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        freopen_s(&f, "CONIN$", "r", stdin);
+    }
+    SelfTestLog("Ultimate AutoClicker - GUI self test\n");
+    SelfTestLog("===============================\n");
+
+    // --- window basics
+    {
+        wchar_t t[128] = {0};
+        GetWindowTextW(hwnd, t, 128);
+        SelfTestLog("- window title\n");
+        ST_CHECK(wcscmp(t, L"Ultimate AutoClicker") == 0, "window title is intact");
+    }
+
+    // --- interval conversion (Enter in the box)
+    SelfTestLog("- interval conversion\n");
+    SetDlgItemTextW(hwnd, ID_MS, L"5000");
+    SendMessage(GetDlgItem(hwnd, ID_MS), WM_KEYDOWN, VK_RETURN, 0);
+    ST_CHECK(CtlText(hwnd, ID_SECS) == L"5", "5000 ms converts to 5 s");
+    ST_CHECK(CtlText(hwnd, ID_MS) == L"0", "the ms field is cleared");
+    ST_CHECK(g_cfg.intervalUs == 5000000, "the engine interval follows the fields");
+
+    // --- zero interval is clamped
+    SelfTestLog("- zero interval clamp\n");
+    SetDlgItemTextW(hwnd, ID_HRS, L"0");
+    SetDlgItemTextW(hwnd, ID_MINS, L"0");
+    SetDlgItemTextW(hwnd, ID_SECS, L"0");
+    SetDlgItemTextW(hwnd, ID_MS, L"0");
+    SetDlgItemTextW(hwnd, ID_US, L"0");
+    SendMessage(GetDlgItem(hwnd, ID_US), WM_KEYDOWN, VK_RETURN, 0);
+    ST_CHECK(g_cfg.intervalUs >= ac::kMinIntervalUs, "a zero interval is clamped to the minimum");
+
+    // --- fast interval for the rest of the test
+    SetDlgItemTextW(hwnd, ID_MS, L"10");
+    SendMessage(GetDlgItem(hwnd, ID_MS), WM_KEYDOWN, VK_RETURN, 0);
+
+    // --- hotkey label
+    SelfTestLog("- hotkey\n");
+    ST_CHECK(CtlText(hwnd, ID_HOTKEY_LABEL).find(L"F6") != std::wstring::npos, "the default hotkey is shown");
+    ST_CHECK(CtlText(hwnd, ID_MAIN_BTN) == L"START CLICKING (F6)", "the start button shows the full hotkey");
+
+    // --- countdown + repeat N + stats
+    SelfTestLog("- start countdown, repeat N, live stats\n");
+    SendMessage(GetDlgItem(hwnd, ID_ACTION_COMBO), CB_SETCURSEL, ACT_TYPE, 0);   // type text
+    SetDlgItemTextW(hwnd, ID_TEXT_EDIT, L"");                                     // empty -> no real input
+    SendMessage(GetDlgItem(hwnd, ID_REP_TIMES), BM_CLICK, 0, 0);
+    SetDlgItemTextW(hwnd, ID_REP_COUNT, L"3");
+    SetDlgItemTextW(hwnd, ID_DELAY_EDIT, L"2");
+
+    SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_MAIN_BTN, 0);
+    PumpMessages(400);
+    EngineStatus st = g_engine->Status();
+    ST_CHECK(st.state == ST_COUNTDOWN, "pressing start begins a countdown");
+    ST_CHECK(st.countdownSec >= 1 && st.countdownSec <= 2, "the countdown shows 1..2 seconds");
+    ST_CHECK(CtlText(hwnd, ID_MAIN_BTN).find(L"STARTING IN") != std::wstring::npos, "the button shows the countdown");
+    ST_CHECK(g_engine->Status().clicksDone == 0, "nothing is clicked during the countdown");
+
+    for (int i = 0; i < 200 && g_engine->IsRunning(); i++) PumpMessages(50);
+    st = g_engine->Status();
+    ST_CHECK(st.state == ST_IDLE, "the engine goes back to idle");
+    ST_CHECK(st.clicksDone == 3, "exactly 3 clicks were performed");
+    PumpMessages(600);
+    ST_CHECK(g_engine->Status().clicksDone == 3, "it does not restart itself (repeat N regression)");
+    ST_CHECK(CtlText(hwnd, ID_STAT_CLICKS).find(L"3") != std::wstring::npos, "the click counter is shown");
+    ST_CHECK(CtlText(hwnd, ID_MAIN_BTN).find(L"START CLICKING") != std::wstring::npos, "the button is back to idle");
+
+    // --- settings round trip through the ini file
+    SelfTestLog("- settings file round trip\n");
+    {
+        std::wstring realIni = g_iniPath;
+        g_iniPath = realIni + L".selftest";
+        ApplyUiToConfig();
+        SaveIni();
+        std::map<std::wstring, std::wstring> ini = ReadIni(g_iniPath);
+        auto it = ini.find(L"Settings/config");
+        ST_CHECK(it != ini.end(), "the settings file was written");
+        Config loaded;
+        bool ok = it != ini.end() && DecodeConfig(it->second, loaded);
+        ST_CHECK(ok, "the settings file can be decoded");
+        if (ok) {
+            ST_CHECK(loaded.intervalUs == g_cfg.intervalUs, "the interval survives the round trip");
+            ST_CHECK(loaded.startDelaySec == g_cfg.startDelaySec, "the start delay survives the round trip");
+            ST_CHECK(loaded.maxClicks == g_cfg.maxClicks, "the repeat count survives the round trip");
+            ST_CHECK(loaded.action == g_cfg.action, "the action survives the round trip");
+            ST_CHECK(loaded.hotkey == g_cfg.hotkey, "the hotkey survives the round trip");
+        }
+        DeleteFileW(g_iniPath.c_str());
+        g_iniPath = realIni;
+    }
+
+    // --- profiles
+    SelfTestLog("- profiles\n");
+    {
+        SendMessage(GetDlgItem(hwnd, ID_PROF_COMBO), WM_SETTEXT, 0, (LPARAM)L"SelfTest");
+        SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_PROF_SAVE, 0);
+        ST_CHECK(g_profiles.size() == 1 && g_profiles[0] == L"SelfTest", "a profile is saved");
+        SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_PROF_DEL, 0);
+        ST_CHECK(g_profiles.empty(), "a profile is deleted");
+    }
+
+    // --- the countdown can be cancelled
+    SelfTestLog("- cancelling the countdown\n");
+    SetDlgItemTextW(hwnd, ID_DELAY_EDIT, L"5");
+    SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_MAIN_BTN, 0);
+    PumpMessages(300);
+    ST_CHECK(g_engine->Status().state == ST_COUNTDOWN, "the countdown is running");
+    SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_MAIN_BTN, 0);
+    PumpMessages(300);
+    ST_CHECK(g_engine->Status().state == ST_IDLE, "pressing start again cancels the countdown");
+    ST_CHECK(g_engine->Status().clicksDone == 0, "nothing was clicked after the cancel");
+
+    // --- the dialogs open and close
+    SelfTestLog("- dialogs\n");
+    {
+        SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_CHANGE_HOTKEY_BTN, 0);
+        HWND hk = FindWindowW(L"HotkeyModalClass", nullptr);
+        ST_CHECK(hk != nullptr, "the hotkey dialog opens");
+        if (hk) { PostMessage(hk, WM_CLOSE, 0, 0); PumpMessages(200); }
+        ST_CHECK(FindWindowW(L"HotkeyModalClass", nullptr) == nullptr, "the hotkey dialog closes");
+
+        SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_SEQ_BTN, 0);
+        HWND sq = FindWindowW(L"SeqModalClass", nullptr);
+        ST_CHECK(sq != nullptr, "the points dialog opens");
+        if (sq) { PostMessage(sq, WM_CLOSE, 0, 0); PumpMessages(200); }
+        ST_CHECK(FindWindowW(L"SeqModalClass", nullptr) == nullptr, "the points dialog closes");
+    }
+
+    // --- restore the defaults
+    SetDlgItemTextW(hwnd, ID_DELAY_EDIT, L"3");
+    SendMessage(GetDlgItem(hwnd, ID_ACTION_COMBO), CB_SETCURSEL, ACT_CLICK, 0);
+    SendMessage(GetDlgItem(hwnd, ID_REP_INF), BM_CLICK, 0, 0);
+    ApplyUiToConfig();
+
+    SelfTestLog("===============================\n");
+    SelfTestLog("%d checks, %d failures\n", g_selfChecks, g_selfFails);
+    return g_selfFails == 0 ? 0 : 1;
+}
+
+// ---------------------------------------------------------------- entry point
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // DPI awareness
     HMODULE hUser32 = GetModuleHandleA("user32.dll");
     if (hUser32) {
         typedef BOOL (WINAPI *pfnSetProcessDpiAwarenessContext)(HANDLE);
-        pfnSetProcessDpiAwarenessContext pSetDpi = (pfnSetProcessDpiAwarenessContext)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
-        if (pSetDpi) {
-            pSetDpi((HANDLE)-4);
-        } else {
+        pfnSetProcessDpiAwarenessContext p = (pfnSetProcessDpiAwarenessContext)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
+        if (p) p((HANDLE)-4);
+        else {
             typedef BOOL (WINAPI *pfnSetProcessDPIAware)(void);
-            pfnSetProcessDPIAware pSetDPIAware = (pfnSetProcessDPIAware)GetProcAddress(hUser32, "SetProcessDPIAware");
-            if (pSetDPIAware) pSetDPIAware();
+            pfnSetProcessDPIAware q = (pfnSetProcessDPIAware)GetProcAddress(hUser32, "SetProcessDPIAware");
+            if (q) q();
         }
     }
 
-    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    hWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    hInterrupt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-    hTimerHandle = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (!hTimerHandle) {
-        hTimerHandle = CreateWaitableTimerW(NULL, FALSE, NULL);
-    }
+    WinClock clock;
+    clock.hInterrupt = hInterrupt;
+    QueryPerformanceFrequency(&clock.qpf);
+    clock.hTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!clock.hTimer) clock.hTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
 
-    hNtdll = LoadLibraryA("ntdll.dll");
-    if (hNtdll) {
-        pfnNtSetTimerResolution pNtSetTimerResolution = (pfnNtSetTimerResolution)GetProcAddress(hNtdll, "NtSetTimerResolution");
-        if (pNtSetTimerResolution) {
-            ULONG actualRes = 0;
-            pNtSetTimerResolution(5000, TRUE, &actualRes);
-        }
-    }
+    // high resolution timer for the whole session, released on exit
+    HMODULE hNtdll = LoadLibraryA("ntdll.dll");
+    typedef NTSTATUS (NTAPI *pfnNtSetTimerResolution)(ULONG, BOOLEAN, PULONG);
+    pfnNtSetTimerResolution pNtSetTimerResolution = nullptr;
+    if (hNtdll) pNtSetTimerResolution = (pfnNtSetTimerResolution)GetProcAddress(hNtdll, "NtSetTimerResolution");
+    if (pNtSetTimerResolution) { ULONG actual = 0; pNtSetTimerResolution(5000, TRUE, &actual); }
 
-    hWinmm = LoadLibraryA("winmm.dll");
-    if (hWinmm) {
-        pfnTimeBeginPeriod pTimeBeginPeriod = (pfnTimeBeginPeriod)GetProcAddress(hWinmm, "timeBeginPeriod");
-        if (pTimeBeginPeriod) pTimeBeginPeriod(1);
-    }
+    WinSink sink;
+    Engine engine(clock, sink);
+    g_clock = &clock;
+    g_sink = &sink;
+    g_engine = &engine;
 
-    INITCOMMONCONTROLSEX icex = { sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS };
+    g_font = CreateFontW(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+    g_bold = CreateFontW(16, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+
+    INITCOMMONCONTROLSEX icex = { sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icex);
 
-    // Register Modal Window Class
-    WNDCLASSEXA wcModal = { 0 };
-    wcModal.cbSize = sizeof(WNDCLASSEXA);
-    wcModal.lpfnWndProc = HotkeyModalProc;
-    wcModal.hInstance = hInstance;
-    wcModal.lpszClassName = "HotkeyModalClass";
-    wcModal.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wcModal.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
-    RegisterClassExA(&wcModal);
-
-    // Register Consecutive Sequence Modal Class
-    WNDCLASSEXA wcSeq = { 0 };
-    wcSeq.cbSize = sizeof(WNDCLASSEXA);
-    wcSeq.lpfnWndProc = SeqModalProc;
-    wcSeq.hInstance = hInstance;
-    wcSeq.lpszClassName = "SeqModalClass";
-    wcSeq.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wcSeq.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
-    RegisterClassExA(&wcSeq);
-
-    // Register Main Window Class
-    WNDCLASSEXA wc = { 0 };
-    wc.cbSize = sizeof(WNDCLASSEXA);
+    WNDCLASSEXW wc = { 0 };
+    wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = "UltimateAutoClicker";
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); 
-    wc.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
-    wc.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
-    RegisterClassExA(&wc);
+    wc.lpszClassName = L"UltimateAutoClicker";
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
+    wc.hIconSm = wc.hIcon;
+    RegisterClassExW(&wc);
 
-    RECT rcWnd = { 0, 0, 385, 515 };
-    AdjustWindowRectEx(&rcWnd, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
-    int wndW = rcWnd.right - rcWnd.left;
-    int wndH = rcWnd.bottom - rcWnd.top;
+    WNDCLASSEXW wcHk = { 0 };
+    wcHk.cbSize = sizeof(wcHk);
+    wcHk.lpfnWndProc = HotkeyModalProc;
+    wcHk.hInstance = hInstance;
+    wcHk.lpszClassName = L"HotkeyModalClass";
+    wcHk.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wcHk.hIcon = wc.hIcon;
+    RegisterClassExW(&wcHk);
 
-    HWND hwnd = CreateWindowA("UltimateAutoClicker", "Ultimate AutoClicker", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, wndW, wndH, NULL, NULL, hInstance, NULL);
+    WNDCLASSEXW wcSeq = { 0 };
+    wcSeq.cbSize = sizeof(wcSeq);
+    wcSeq.lpfnWndProc = SeqModalProc;
+    wcSeq.hInstance = hInstance;
+    wcSeq.lpszClassName = L"SeqModalClass";
+    wcSeq.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wcSeq.hIcon = wc.hIcon;
+    RegisterClassExW(&wcSeq);
+
+    // default config + saved settings
+    g_cfg.hotkey.mods = 0;
+    g_cfg.hotkey.keys = { VK_F6 };
+    g_iniPath = IniPath();
+    LoadIni();
+    if (g_cfg.hotkey.empty()) { g_cfg.hotkey.keys = { VK_F6 }; }
+    engine.ApplyConfig(g_cfg);
+
+    RECT rc = { 0, 0, 500, 700 };
+    AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
+    HWND hwnd = CreateWindowExW(0, L"UltimateAutoClicker", L"Ultimate AutoClicker",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, hInstance, nullptr);
 
     ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
 
-    hClickEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-    HANDLE hThread = CreateThread(NULL, 0, ClickerThread, NULL, 0, NULL);
+    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbHookProc, GetModuleHandleW(nullptr), 0);
+
+    HANDLE hThread = CreateThread(nullptr, 0, ClickerThread, nullptr, 0, nullptr);
+
+    // --selftest: drive the real UI and report, then exit
+    bool selftest = wcsstr(GetCommandLineW(), L"--selftest") != nullptr;
+    if (selftest) {
+        int rc = RunSelfTest(hwnd);
+        if (g_engine->IsRunning()) { g_engine->Stop(); SetEvent(hInterrupt); }
+        DestroyWindow(hwnd);
+        SetEvent(hWake);
+        SetEvent(hInterrupt);
+        WaitForSingleObject(hThread, 2000);
+        CloseHandle(hThread);
+        return rc;
+    }
 
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
         if (!IsDialogMessage(hwnd, &msg)) {
             TranslateMessage(&msg);
-            DispatchMessage(&msg);
+            DispatchMessageW(&msg);
         }
     }
 
-    running = false;
-    SetEvent(hClickEvent); 
-    WaitForSingleObject(hThread, INFINITE);
+    g_running = false;
+    SetEvent(hWake);
+    SetEvent(hInterrupt);
+    WaitForSingleObject(hThread, 2000);
     CloseHandle(hThread);
-    CloseHandle(hClickEvent);
+    CloseHandle(hWake);
+    CloseHandle(hInterrupt);
 
+    if (clock.hTimer) CloseHandle(clock.hTimer);
+    if (pNtSetTimerResolution) { ULONG actual = 0; pNtSetTimerResolution(5000, FALSE, &actual); }   // release the resolution
+    if (hNtdll) FreeLibrary(hNtdll);
+    TimerResolutionOff();
+    if (g_font) DeleteObject(g_font);
+    if (g_bold) DeleteObject(g_bold);
     return 0;
 }
