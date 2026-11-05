@@ -16,6 +16,8 @@ Written in pure C++ against raw Windows APIs, it utilizes kernel high-resolution
 ### Download for Windows
 Download **[UltimateAutoClicker.exe](https://github.com/kuy124/UltimateAutoClicker/releases/latest/download/UltimateAutoClicker.exe)** and run it. No installation is required.
 
+The app runs without administrator permissions. To automate an app running as administrator, launch AutoClicker using **Run as administrator** too; Windows blocks normal apps from sending input to elevated apps.
+
 ### What's new in 1.2.2
 * **Basic by default:** essential click controls with more space between settings.
 * **Focused Advanced tabs:** Clicking, Automation, and Profiles replace the crowded all-in-one panel.
@@ -46,11 +48,34 @@ g++ src/core.cpp src/main.cpp build/resource.res -o bin/UltimateAutoClicker.exe 
 
 The interface starts in **Basic** on every launch, with spaced-out interval, mouse button, click type, repeat count, and start/stop shortcut controls. Use the **View** selector for **Advanced**, organised into **Clicking**, **Automation**, and **Profiles** tabs instead of one long settings panel. Start/Stop stays visible on every tab. Switching views preserves settings, including active settings on hidden tabs. The mode selection is not saved.
 
+### Screenshots
+
+#### Basic
+Essential click controls, with Basic selected on every launch.
+
+![Basic interface with interval, click options, repeat controls, and Start button](screenshots/basic.png)
+
+#### Advanced — Clicking
+Click settings and random intervals, without the automation controls crowding the screen.
+
+![Advanced Clicking tab with interval, randomisation, and click options](screenshots/advanced-clicking.png)
+
+#### Advanced — Automation
+Alternate actions, cursor locations, point sequences, and timing controls.
+
+![Advanced Automation tab with action, cursor position, and timing settings](screenshots/advanced-automation.png)
+
+#### Advanced — Profiles
+Save and restore named configurations.
+
+![Advanced Profiles tab with profile selection and save, load, and delete buttons](screenshots/advanced-profiles.png)
+
 ### Project layout
 
 ```text
 src/       C++ application and engine
 assets/    Icon, manifest, and Windows resource file
+screenshots/ App screenshots used in this README
 tests/     Engine test source
 build/     Generated test executables and compiled resources (ignored)
 bin/       Application executable and portable settings (ignored)

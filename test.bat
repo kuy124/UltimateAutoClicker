@@ -3,6 +3,9 @@ setlocal
 cd /d "%~dp0"
 if not exist build mkdir build
 
+powershell -NoProfile -Command "$manifest = [xml](Get-Content -Raw 'assets/manifest.xml'); $level = $manifest.assembly.trustInfo.security.requestedPrivileges.requestedExecutionLevel; if ($level.level -ne 'asInvoker' -or $level.uiAccess -ne 'false') { Write-Error 'App must run without requesting elevation.'; exit 1 }"
+if errorlevel 1 exit /b 1
+
 rem The GUI test binary is linked GUI-style but with a console subsystem so the
 rem self test output is visible. It is built without the icon resource because
 rem some AV scanners refuse to start icon-carrying binaries from a test run.
