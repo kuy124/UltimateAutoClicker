@@ -25,8 +25,9 @@ enum {
     ID_DELAY_EDIT, ID_HOLD_EDIT,
     ID_HOTKEY_LABEL, ID_CHANGE_HOTKEY_BTN,
     ID_TOP_CHECK, ID_MAIN_BTN,
-    ID_STAT_CLICKS, ID_STAT_TIME, ID_STAT_CPS,
+    ID_STAT_CLICKS,
     ID_PROF_COMBO, ID_PROF_SAVE, ID_PROF_LOAD, ID_PROF_DEL,
+    ID_UI_MODE, ID_UI_TABS,
     ID_SEQ_LIST = 401, ID_SEQ_ADD_BTN, ID_SEQ_DEL_BTN, ID_SEQ_CLR_BTN,
     ID_SEQ_IN_X, ID_SEQ_IN_Y, ID_SEQ_IN_D, ID_SEQ_REC_BTN
 };
@@ -51,6 +52,12 @@ static HANDLE hWake = nullptr, hInterrupt = nullptr;
 static bool  g_running = true;
 static bool  g_periodActive = false;
 static bool  g_lastBusy = false;
+static bool  g_advanced = false;
+static int MainContentHeight() { return g_advanced ? 570 : 530; }
+enum { UI_INTERVAL, UI_RANDOM, UI_CLICK, UI_ACTION, UI_REPEAT, UI_POSITION,
+       UI_TIMING, UI_SHORTCUT, UI_PROFILES, UI_FOOTER };
+struct MainControl { HWND hwnd; int x, y, w, h, section; };
+static std::vector<MainControl> g_mainControls;
 
 static int   g_pickMode = 0;              // 0 none, 1 pick location, 2 record clicks
 static bool  g_hotkeyDlgOpen = false;
@@ -241,7 +248,7 @@ static void UpdateScroll(HWND hwnd) {
     GetScrollInfo(hwnd, SB_VERT, &info);
     int old = info.nPos;
     info.nMin = 0;
-    info.nMax = 699;
+    info.nMax = MainContentHeight() - 1;
     info.nPage = client.bottom;
     SetScrollInfo(hwnd, SB_VERT, &info, TRUE);
     GetScrollInfo(hwnd, SB_VERT, &info);
@@ -571,15 +578,9 @@ static void UpdateButton() {
 
 static void UpdateStats() {
     EngineStatus st = g_engine->Status();
-    unsigned long long el = g_engine->ElapsedUs();
     wchar_t buf[64];
     swprintf_s(buf, 64, L"%d", st.clicksDone);
     SetText(GetDlgItem(g_mainWnd, ID_STAT_CLICKS), L"Clicks: " + std::wstring(buf));
-    swprintf_s(buf, 64, L"%02llu:%02llu:%02llu", el / 3600000000ULL, (el / 60000000ULL) % 60, (el / 1000000ULL) % 60);
-    SetText(GetDlgItem(g_mainWnd, ID_STAT_TIME), L"Time: " + std::wstring(buf));
-    double cps = el > 0 ? (double)st.clicksDone * 1000000.0 / (double)el : 0.0;
-    swprintf_s(buf, 64, L"%.1f", cps);
-    SetText(GetDlgItem(g_mainWnd, ID_STAT_CPS), L"CPS: " + std::wstring(buf));
 
     bool busy = st.state != ST_IDLE;
     if (busy != g_lastBusy) {
@@ -1007,9 +1008,66 @@ static LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LP
 }
 
 // ---------------------------------------------------------------- main window
+static void LayoutMain(HWND hwnd) {
+    ScrollMain(hwnd, 0);
+    HWND tabs = GetDlgItem(hwnd, ID_UI_TABS);
+    ShowWindow(tabs, g_advanced ? SW_SHOW : SW_HIDE);
+    int page = TabCtrl_GetCurSel(tabs);
+    const int originalTop[] = {8, 90, 144, 205, 266, 320, 431, 485, 539, 596};
+    const int basicTop[] = {52, -1, 164, -1, 260, -1, -1, 340, -1, 420};
+    const int clickingTop[] = {92, -1, 204, -1, 300, -1, -1, 380, -1, 460};
+    const int automationTop[] = {-1, 92, -1, 172, -1, 252, 388, -1, -1, 460};
+    const int profilesTop[] = {-1, -1, -1, -1, -1, -1, -1, -1, 92, 460};
+    const int* top = !g_advanced ? basicTop : page == 1 ? automationTop : page == 2 ? profilesTop : clickingTop;
+    for (const auto& c : g_mainControls) {
+        int id = GetDlgCtrlID(c.hwnd);
+        bool visible = top[c.section] >= 0;
+        bool group = c.y == originalTop[c.section] && c.section != UI_FOOTER;
+        int x = c.x, y = top[c.section] + c.y - originalTop[c.section], w = c.w, h = c.h;
+        if (group) {
+            x = 16; w = 468;
+            const int heights[] = {96, 64, 80, 64, 64, 120, 64, 64, 104};
+            h = heights[c.section];
+        } else {
+            x = std::max(28, x);
+            y += 8;
+        }
+        if (c.section == UI_INTERVAL && !group) {
+            const int fields[] = {ID_HRS, ID_MINS, ID_SECS, ID_MS, ID_US};
+            for (int i = 0; i < 5; ++i) {
+                if (id == fields[i]) { x = 28 + i * 90; y = top[UI_INTERVAL] + 42; w = 78; h = 26; }
+            }
+            if (!id) { x = 28 + ((c.x - 18 + 35) / 69) * 90; y = top[UI_INTERVAL] + 22; w = 78; }
+            if (id == ID_WARN_STATIC) { x = 28; y = top[UI_INTERVAL] + 72; w = 438; h = 20; }
+        }
+        if (c.section == UI_CLICK && !group) {
+            int column = c.x < 190 ? 0 : c.x < 320 ? 1 : 2;
+            bool combo = id == ID_BTN_COMBO || id == ID_TYPE_COMBO || id == ID_MODE_COMBO;
+            visible = visible && (g_advanced || column != 2);
+            int columnWidth = g_advanced ? 150 : 225;
+            x = 28 + column * columnWidth;
+            y = top[UI_CLICK] + (combo ? 42 : 22);
+            w = columnWidth - 16;
+        }
+        if (c.section == UI_PROFILES && !group) {
+            if (id == ID_PROF_COMBO) { x = 28; y = top[UI_PROFILES] + 24; w = 438; }
+            else { x = 28 + (id - ID_PROF_SAVE) * 150; y = top[UI_PROFILES] + 60; w = 138; }
+        }
+        if (id == ID_TOP_CHECK) { x = 320; y = top[UI_FOOTER] + 8; w = 158; }
+        if (id == ID_MAIN_BTN) { x = 16; y = top[UI_FOOTER] + 42; w = 468; h = 48; }
+        SetWindowPos(c.hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        ShowWindow(c.hwnd, visible ? SW_SHOW : SW_HIDE);
+    }
+    SizeClient(hwnd, 500, MainContentHeight());
+    UpdateScroll(hwnd);
+    InvalidateRect(hwnd, nullptr, TRUE);
+}
+
 static void BuildUi(HWND hwnd) {
+    int section = -1;
     auto Add = [&](LPCWSTR cls, LPCWSTR txt, DWORD style, int x, int y, int w, int h, int id, HFONT f = nullptr) {
         if (wcscmp(cls, L"BUTTON") == 0 && (style & 0xf) == BS_GROUPBOX) {
+            ++section;
             w += 60;
             style |= WS_GROUP;
         }
@@ -1019,6 +1077,7 @@ static void BuildUi(HWND hwnd) {
         if (wcscmp(cls, L"EDIT") == 0) style |= ES_AUTOHSCROLL;
         HWND c = CreateWindowExW(0, cls, txt, WS_VISIBLE | WS_CHILD | style, x, y, w, h, hwnd,
                                  (HMENU)(UINT_PTR)id, nullptr, nullptr);
+        g_mainControls.push_back({c, x, y, w, h, section});
         SendMessage(c, WM_SETFONT, (WPARAM)(f ? f : g_font), TRUE);
         return c;
     };
@@ -1053,11 +1112,11 @@ static void BuildUi(HWND hwnd) {
 
     // --- click options
     Add(L"BUTTON", L"Click Options", BS_GROUPBOX, 10, 144, 480, 55, 0);
-    Add(L"STATIC", L"Mouse Button:", 0, 22, 162, 95, 20, 0);
+    Add(L"STATIC", L"Button:", 0, 22, 162, 95, 20, 0);
     HWND hBtnCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP, 118, 158, 95, 120, ID_BTN_COMBO);
     Add(L"STATIC", L"Type:", 0, 222, 162, 40, 20, 0);
     HWND hTypeCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP, 264, 158, 90, 120, ID_TYPE_COMBO);
-    Add(L"STATIC", L"Mode:", 0, 362, 162, 42, 20, 0);
+    Add(L"STATIC", L"Run:", 0, 362, 162, 42, 20, 0);
     HWND hModeCombo = Add(L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP, 406, 158, 132, 120, ID_MODE_COMBO);
     SendMessageW(hBtnCombo, CB_ADDSTRING, 0, (LPARAM)L"Left");
     SendMessageW(hBtnCombo, CB_ADDSTRING, 0, (LPARAM)L"Right");
@@ -1066,7 +1125,7 @@ static void BuildUi(HWND hwnd) {
     SendMessageW(hTypeCombo, CB_ADDSTRING, 0, (LPARAM)L"Double");
     SendMessageW(hModeCombo, CB_ADDSTRING, 0, (LPARAM)L"Repeat");
     SendMessageW(hModeCombo, CB_ADDSTRING, 0, (LPARAM)L"Hold");
-    SendMessageW(hModeCombo, CB_ADDSTRING, 0, (LPARAM)L"Single");
+    SendMessageW(hModeCombo, CB_ADDSTRING, 0, (LPARAM)L"Once");
     SendMessage(hBtnCombo, CB_SETCURSEL, 0, 0);
     SendMessage(hTypeCombo, CB_SETCURSEL, 0, 0);
     SendMessage(hModeCombo, CB_SETCURSEL, 0, 0);
@@ -1084,7 +1143,7 @@ static void BuildUi(HWND hwnd) {
     Add(L"EDIT", L"Hello", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 270, 219, 268, 23, ID_TEXT_EDIT);
 
     // --- repeat
-    Add(L"BUTTON", L"Click Repeat", BS_GROUPBOX, 10, 266, 480, 48, 0);
+    Add(L"BUTTON", L"When to Stop", BS_GROUPBOX, 10, 266, 480, 48, 0);
     Add(L"BUTTON", L"Repeat until stopped", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 22, 284, 180, 20, ID_REP_INF);
     Add(L"BUTTON", L"Repeat", BS_AUTORADIOBUTTON, 224, 284, 78, 20, ID_REP_TIMES);
     Add(L"EDIT", L"10", WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_CENTER, 310, 282, 72, 23, ID_REP_COUNT);
@@ -1113,7 +1172,7 @@ static void BuildUi(HWND hwnd) {
     Add(L"STATIC", L"(button down time)", 0, 326, 449, 212, 20, 0);
 
     // --- hotkey
-    Add(L"BUTTON", L"Hotkey", BS_GROUPBOX, 10, 485, 480, 48, 0);
+    Add(L"BUTTON", L"Start / Stop Shortcut", BS_GROUPBOX, 10, 485, 480, 48, 0);
     Add(L"STATIC", L"Hotkey: F6", SS_ENDELLIPSIS, 22, 503, 336, 20, ID_HOTKEY_LABEL, g_bold);
     Add(L"BUTTON", L"Change Hotkey...", BS_PUSHBUTTON | WS_TABSTOP, 370, 499, 168, 28, ID_CHANGE_HOTKEY_BTN);
 
@@ -1126,14 +1185,29 @@ static void BuildUi(HWND hwnd) {
     Add(L"BUTTON", L"Delete", BS_PUSHBUTTON | WS_TABSTOP, 452, 555, 86, 28, ID_PROF_DEL);
 
     // --- status
+    section = UI_FOOTER;
     Add(L"STATIC", L"Clicks: 0", 0, 22, 596, 170, 20, ID_STAT_CLICKS);
-    Add(L"STATIC", L"Time: 00:00:00", 0, 202, 596, 170, 20, ID_STAT_TIME);
-    Add(L"STATIC", L"CPS: 0.0", 0, 382, 596, 156, 20, ID_STAT_CPS);
     Add(L"BUTTON", L"Always on Top", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 620, 180, 20, ID_TOP_CHECK);
     Add(L"BUTTON", L"START CLICKING (F6)", BS_PUSHBUTTON | WS_TABSTOP, 10, 650, 540, 36, ID_MAIN_BTN, g_bold);
 
     SendMessage(GetDlgItem(hwnd, ID_REP_INF), BM_SETCHECK, BST_CHECKED, 0);
     SendMessage(GetDlgItem(hwnd, ID_POS_CUR), BM_SETCHECK, BST_CHECKED, 0);
+    size_t contentControls = g_mainControls.size();
+    Add(L"STATIC", L"View:", 0, 22, 8, 76, 20, 0);
+    HWND mode = Add(L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP, 102, 5, 180, 100, ID_UI_MODE);
+    SendMessageW(mode, CB_ADDSTRING, 0, (LPARAM)L"Basic");
+    SendMessageW(mode, CB_ADDSTRING, 0, (LPARAM)L"Advanced");
+    SendMessage(mode, CB_SETCURSEL, 0, 0);
+    // Keep the view selector first in keyboard navigation, before the click controls.
+    SetWindowPos(mode, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    HWND tabs = Add(WC_TABCONTROLW, L"", WS_TABSTOP, 16, 42, 522, 30, ID_UI_TABS);
+    for (const wchar_t* caption : {L"Clicking", L"Automation", L"Profiles"}) {
+        TCITEMW item = {};
+        item.mask = TCIF_TEXT;
+        item.pszText = const_cast<wchar_t*>(caption);
+        TabCtrl_InsertItem(tabs, TabCtrl_GetItemCount(tabs), &item);
+    }
+    g_mainControls.resize(contentControls);
 }
 
 static void RefreshProfileCombo() {
@@ -1145,10 +1219,19 @@ static void RefreshProfileCombo() {
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_NOTIFY: {
+            NMHDR* notification = (NMHDR*)lParam;
+            if (notification->idFrom == ID_UI_TABS && notification->code == TCN_SELCHANGE) {
+                LayoutMain(hwnd);
+                return 0;
+            }
+            break;
+        }
         case WM_CREATE: {
             g_mainWnd = hwnd;
             BuildUi(hwnd);
             ScaleUi(hwnd, 96);
+            LayoutMain(hwnd);
             ApplyConfigToUi();
             UpdateEnabledStates();
             UpdateWarning();
@@ -1235,7 +1318,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             RECT* r = (RECT*)lParam;
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                 SWP_NOZORDER | SWP_NOACTIVATE);
-            SizeClient(hwnd, 500, 700);
+            SizeClient(hwnd, 500, MainContentHeight());
             break;
         }
         case WM_COMMAND: {
@@ -1260,6 +1343,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (wcscmp(cls, L"Button") == 0) break;
             }
             switch (id) {
+                case ID_UI_MODE:
+                    if (HIWORD(wParam) == CBN_SELCHANGE) {
+                        g_advanced = SendDlgItemMessage(hwnd, ID_UI_MODE, CB_GETCURSEL, 0, 0) == 1;
+                        LayoutMain(hwnd);
+                    }
+                    break;
                 case ID_MAIN_BTN: ToggleClicking(); break;
                 case ID_PICK_BTN: {
                     g_pickMode = 1;
@@ -1464,6 +1553,70 @@ static int RunSelfTest(HWND hwnd) {
     SelfTestLog("Ultimate AutoClicker - GUI self test\n");
     SelfTestLog("===============================\n");
 
+    SelfTestLog("- interface modes\n");
+    ST_CHECK(!g_advanced && SendDlgItemMessage(hwnd, ID_UI_MODE, CB_GETCURSEL, 0, 0) == 0,
+             "each launch defaults to Basic");
+    ST_CHECK(!IsWindowVisible(GetDlgItem(hwnd, ID_RAND_CHECK)) &&
+             !IsWindowVisible(GetDlgItem(hwnd, ID_PROF_COMBO)), "Basic hides advanced controls");
+    ST_CHECK(IsWindowVisible(GetDlgItem(hwnd, ID_MAIN_BTN)) &&
+             IsWindowVisible(GetDlgItem(hwnd, ID_MS)), "Basic keeps essential controls");
+    CheckCaptionFits(hwnd, ID_PICK_BTN);
+    std::wstring intervalBeforeSwitch = CtlText(hwnd, ID_MS);
+    SetDlgItemTextW(hwnd, ID_TEXT_EDIT, L"mode switch preserves settings");
+    for (int mode : {1, 0, 1}) {
+        SendDlgItemMessage(hwnd, ID_UI_MODE, CB_SETCURSEL, mode, 0);
+        SendMessage(hwnd, WM_COMMAND, MAKEWPARAM(ID_UI_MODE, CBN_SELCHANGE),
+                    (LPARAM)GetDlgItem(hwnd, ID_UI_MODE));
+        ST_CHECK(g_advanced == (mode == 1), "mode selector changes interface");
+        ST_CHECK(!IsWindowVisible(GetDlgItem(hwnd, ID_ACTION_COMBO)) &&
+                 !IsWindowVisible(GetDlgItem(hwnd, ID_POS_CUR)) &&
+                 IsWindowVisible(GetDlgItem(hwnd, ID_MODE_COMBO)) == (mode == 1),
+                 "Clicking view only shows relevant controls");
+        ST_CHECK(IsWindowVisible(GetDlgItem(hwnd, ID_TYPE_COMBO)) &&
+                 IsWindowVisible(GetDlgItem(hwnd, ID_REP_COUNT)), "common click controls stay available");
+        for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            wchar_t textBuffer[128] = {0};
+            GetWindowTextW(child, textBuffer, 128);
+            std::wstring text(textBuffer);
+            ST_CHECK(text.find(L"Time:") != 0 && text.find(L"CPS:") != 0 &&
+                     text != L"Advanced settings stay active.", "removed labels are absent");
+            if (!IsWindowVisible(child)) continue;
+            RECT bounds;
+            GetWindowRect(child, &bounds);
+            MapWindowPoints(nullptr, hwnd, (POINT*)&bounds, 2);
+            ST_CHECK(bounds.left >= 0 && bounds.right <= 500 && bounds.top >= 0 &&
+                     bounds.bottom <= MainContentHeight(), "visible controls fit each mode layout");
+        }
+        ST_CHECK(CtlText(hwnd, ID_TEXT_EDIT) == L"mode switch preserves settings" &&
+                 CtlText(hwnd, ID_MS) == intervalBeforeSwitch, "mode changes preserve settings");
+        RECT button, client;
+        GetWindowRect(GetDlgItem(hwnd, ID_MAIN_BTN), &button);
+        MapWindowPoints(nullptr, hwnd, (POINT*)&button, 2);
+        GetClientRect(hwnd, &client);
+        SCROLLINFO scroll = {sizeof(scroll), SIF_RANGE};
+        GetScrollInfo(hwnd, SB_VERT, &scroll);
+        ST_CHECK(button.bottom <= client.bottom || scroll.nMax == MainContentHeight() - 1,
+                 "mode layout fits or scrolls");
+    }
+
+    for (int page : {1, 2, 0}) {
+        TabCtrl_SetCurSel(GetDlgItem(hwnd, ID_UI_TABS), page);
+        NMHDR notification = {GetDlgItem(hwnd, ID_UI_TABS), ID_UI_TABS, TCN_SELCHANGE};
+        SendMessage(hwnd, WM_NOTIFY, ID_UI_TABS, (LPARAM)&notification);
+        ST_CHECK(IsWindowVisible(GetDlgItem(hwnd, ID_POS_CUR)) == (page == 1) &&
+                 IsWindowVisible(GetDlgItem(hwnd, ID_PROF_COMBO)) == (page == 2) &&
+                 IsWindowVisible(GetDlgItem(hwnd, ID_MS)) == (page == 0), "tabs show only their own settings");
+        ST_CHECK(IsWindowVisible(GetDlgItem(hwnd, ID_MAIN_BTN)), "Start remains visible on every tab");
+        for (const auto& control : g_mainControls) {
+            if (!IsWindowVisible(control.hwnd)) continue;
+            RECT bounds;
+            GetWindowRect(control.hwnd, &bounds);
+            MapWindowPoints(nullptr, hwnd, (POINT*)&bounds, 2);
+            ST_CHECK(bounds.left >= 0 && bounds.right <= 500 && bounds.top >= 0 &&
+                     bounds.bottom <= MainContentHeight(), "tab controls fit the window");
+        }
+    }
+
     // --- window basics
     {
         wchar_t t[128] = {0};
@@ -1503,13 +1656,13 @@ static int RunSelfTest(HWND hwnd) {
     GetWindowRect(hwnd, &beforeDpi);
     SendMessage(hwnd, WM_DPICHANGED, MAKEWPARAM(192, 192), (LPARAM)&beforeDpi);
     GetClientRect(hwnd, &compact);
-    ST_CHECK(compact.right <= 500 && compact.bottom <= 700, "high DPI keeps the original pixel footprint");
+    ST_CHECK(compact.right <= 500 && compact.bottom <= MainContentHeight(), "high DPI keeps the compact pixel footprint");
     MONITORINFO monitor = {sizeof(monitor)};
     GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor);
     RECT outer;
     GetWindowRect(hwnd, &outer);
-    if (monitor.rcWork.bottom - monitor.rcWork.top >= outer.bottom - outer.top + 700 - compact.bottom) {
-        ST_CHECK(compact.bottom == 700, "window borders leave the full content height");
+    if (monitor.rcWork.bottom - monitor.rcWork.top >= outer.bottom - outer.top + MainContentHeight() - compact.bottom) {
+        ST_CHECK(compact.bottom == MainContentHeight(), "window borders leave the full content height");
         ST_CHECK(!(GetWindowLongPtr(hwnd, GWL_STYLE) & WS_VSCROLL), "full compact layout needs no scrollbar");
     }
     ST_CHECK(CtlText(hwnd, ID_HOTKEY_LABEL).find(L"F6") != std::wstring::npos, "the default hotkey is shown");
@@ -1726,7 +1879,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VSCROLL,
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, hInstance, nullptr);
 
-    SizeClient(hwnd, 500, 700);
+    SizeClient(hwnd, 500, MainContentHeight());
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 

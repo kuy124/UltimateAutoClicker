@@ -13,6 +13,15 @@ Written in pure C++ against raw Windows APIs, it utilizes kernel high-resolution
 
 ## Quick Start & Building
 
+### Download for Windows
+Download **[UltimateAutoClicker.exe](https://github.com/kuy124/UltimateAutoClicker/releases/latest/download/UltimateAutoClicker.exe)** and run it. No installation is required.
+
+### What's new in 1.2.2
+* **Basic by default:** essential click controls with more space between settings.
+* **Focused Advanced tabs:** Clicking, Automation, and Profiles replace the crowded all-in-one panel.
+* **Clearer controls:** interval labels above inputs, improved grouping, and a larger Start/Stop button visible on every tab.
+* **Simpler footer:** click count only; elapsed time, CPS, and the advanced-settings note have been removed.
+
 ### Option A: 1-Click Build Script (`build.bat`)
 If you have MinGW-w64 / GCC installed:
 1. Double-click `build.bat` in the project directory.
@@ -32,6 +41,10 @@ g++ src/core.cpp src/main.cpp build/resource.res -o bin/UltimateAutoClicker.exe 
 <hr>
 
 ## Core Features & Capabilities
+
+### Basic and Advanced interfaces
+
+The interface starts in **Basic** on every launch, with spaced-out interval, mouse button, click type, repeat count, and start/stop shortcut controls. Use the **View** selector for **Advanced**, organised into **Clicking**, **Automation**, and **Profiles** tabs instead of one long settings panel. Start/Stop stays visible on every tab. Switching views preserves settings, including active settings on hidden tabs. The mode selection is not saved.
 
 ### Project layout
 
@@ -66,7 +79,7 @@ Run `build.bat` or `test.bat` from the project root. Launch the app from `bin/Ul
 
 ### 5. Full High-DPI Scaling Support (Per-Monitor V2)
 * Coordinates remain accurate on displays scaled at **125%**, **150%**, **175%**, or **200%+**.
-* The main window keeps its original compact 500 × 700 pixel layout, including on scaled displays. Dialog controls and fonts scale with display DPI, and their sizes account for title bars and borders. The main window scrolls on shorter screens.
+* The main window keeps a compact 500-pixel content width, with 530-pixel Basic and 570-pixel Advanced content heights, including on scaled displays. Dialog controls and fonts scale with display DPI, and their sizes account for title bars and borders. The main window scrolls on shorter screens.
 
 ### 6. Smart Interval Auto-Conversion
 * Enter decimals or large numbers across **Hours**, **Minutes**, **Seconds**, **Milliseconds**, and **Microseconds ($\mu\text{s}$)** fields.
@@ -83,7 +96,7 @@ Run `build.bat` or `test.bat` from the project root. Launch the app from `bin/Ul
 
 ### 9. System Tray, Statistics & Profiles
 * Minimise the window to the system tray, or keep it floating with **Always on Top**.
-* Live **click count**, **elapsed time** and measured **CPS** while it runs.
+* Live **click count** while it runs, without extra statistics crowding the interface.
 * Save the current settings as a named **profile** and load it again later.
 
 <hr>
@@ -91,14 +104,15 @@ Run `build.bat` or `test.bat` from the project root. Launch the app from `bin/Ul
 ## How to Use
 
 1. **Set Interval:** Specify your interval across the time boxes and press **Enter** to commit. Use **$\mu\text{s}$** for sub-millisecond intervals.
-2. **Set Start Delay:** Choose how many seconds to wait after pressing start (3 by default).
+2. **Set Start Delay (optional):** Switch to **Advanced → Automation** to change the delay before clicking (3 seconds by default).
 3. **Select Mouse Button & Type:** Choose Left, Right, or Middle button, and Single, Double or Hold.
 4. **Set Repeat Limit:** Choose **Repeat until stopped** or set a fixed click count.
-5. **Choose Location Mode:**
+5. **Choose Location Mode (optional):** Open **Advanced → Automation** for:
    * **Current Location:** Clicks wherever your pointer is positioned.
    * **Specific Location:** Clicks a single static $(X, Y)$ coordinate.
    * **Consecutive Points:** Click **Manage Points...** to configure a multi-target queue.
 6. **Start / Stop:** Press your global hotkey (default: **F6**) or click the main button. Click **Change Hotkey...** to assign a new hotkey.
+7. **Save Settings as a Profile (optional):** Open **Advanced → Profiles** to save, load, or delete a named profile.
 
 <hr>
 
@@ -125,7 +139,7 @@ test.bat
 The suite has two parts:
 
 * **153 engine unit checks** (`tests.exe`) run the click engine on a virtual clock: interval maths, the interval clamp, randomised intervals, drift free scheduling, double clicks, hold mode, sequence playback with per point delays, scrolling, auto typing, the hotkey matcher and the config codec. They also cover the regressions for the endless "repeat N" restart and the zero interval spin lock. The virtual clock keeps the results deterministic.
-* **126 GUI checks** (`guitest.exe --selftest`) drive the real window: title, interval conversion, countdown cancellation, live statistics, settings round trip, profiles, modal dialogs, control bounds and font scaling at 100%/150%/200%, button text fit, compact window size across DPI changes, and small-screen scrolling.
+* **520 GUI checks** (`guitest.exe --selftest`) drive the real window: Basic defaults, mode switching, Advanced tab navigation, visible control bounds, title, interval conversion, countdown cancellation, click count, settings round trip, profiles, modal dialogs, font scaling at 100%/150%/200%, button text fit, compact window size across DPI changes, and small-screen scrolling.
 
 <hr>
 
