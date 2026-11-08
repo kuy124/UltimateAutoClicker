@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Ultimate AutoClicker
+Comment=Automate mouse clicks on X11 desktops
+Exec=ultimate-autoclicker
+Icon=input-mouse
+Terminal=false
+Categories=Utility;Accessibility;

@@ -1,13 +1,13 @@
 <div align="center">
   <h1>Ultimate AutoClicker</h1>
   <p>
-    <b>An ultra-lightweight, hardware-timed click automation engine built with native Win32 APIs for Windows.</b>
+    <b>A lightweight native auto-clicker for Windows and Linux X11.</b>
   </p>
 </div>
 
 Ultimate AutoClicker is a high-precision, zero-drift mouse automation utility engineered for demanding tasks, game automation, and testing workflows.
 
-Written in pure C++ against raw Windows APIs, it utilizes kernel high-resolution timers, hardware QueryPerformanceCounter scheduling, and Per-Monitor V2 DPI awareness. It consumes **0% CPU when idle**, drives well past **1,000 CPS**, and ships as a single executable of roughly half a megabyte.
+The Windows edition uses native Win32 APIs, high-resolution timers, QueryPerformanceCounter scheduling, and Per-Monitor V2 DPI awareness. The Linux edition uses GTK 3, X11 XTEST input, and a monotonic, interruptible clock with the same tested automation engine. Performance depends on the desktop and target application.
 
 <hr>
 
@@ -19,12 +19,44 @@ Download **[UltimateAutoClicker.exe](https://github.com/kuy124/UltimateAutoClick
 The app runs without administrator permissions. To automate an app running as administrator, launch AutoClicker using **Run as administrator** too; Windows blocks normal apps from sending input to elevated apps.
 
 ### What's new in 1.2.2
+* **Two platform editions:** Windows and Linux X11; Linux downloads include DEB, RPM, tar.gz, tar.xz, and ZIP packages, with SHA-256 checksums.
 * **Basic by default:** essential click controls with more space between settings.
 * **Focused Advanced tabs:** Clicking, Automation, and Profiles replace the crowded all-in-one panel.
 * **Clearer controls:** interval labels above inputs, improved grouping, and a larger Start/Stop button visible on every tab.
 * **Simpler footer:** click count only; elapsed time, CPS, and the advanced-settings note have been removed.
 
-### Option A: 1-Click Build Script (`build.bat`)
+### Download and build for Linux (X11)
+
+Get Linux packages from [release 1.2.2](https://github.com/kuy124/UltimateAutoClicker/releases/tag/1.2.2).
+These packages target **x86-64 Linux**, built on Ubuntu 24.04 (glibc 2.39); build from source on older distributions.
+Choose `.deb` for Debian/Ubuntu, `.rpm` for RPM-based distributions, or `.tar.gz`, `.tar.xz`, or `.zip` for manual installation.
+Archives require GTK 3, libX11, and libXtst installed separately. Verify downloads with the accompanying `SHA256SUMS-linux.txt`.
+
+```sh
+sudo apt install ./UltimateAutoClicker-1.2.2-Linux-x86_64.deb
+# Or extract an archive and run ./bin/ultimate-autoclicker
+```
+
+Use an **X11/Xorg session**. Native Wayland automation is unsupported; XWayland cannot control native Wayland applications.
+No root or input-device permissions are needed to run the app. **F6** toggles automation globally.
+The Linux interface supports interval/randomization, all three mouse buttons, single/double/hold clicks, scrolling, fixed coordinates, repeat limits, countdown, and hold duration.
+Windows-only interface features (profiles, sequence editing/recording, typing, custom hotkey capture, and Basic/Advanced tabs) are not exposed in the Linux edition.
+Settings live in `$XDG_CONFIG_HOME/ultimate-autoclicker/settings.ini` (default `~/.config/ultimate-autoclicker/settings.ini`).
+
+```sh
+sudo apt install build-essential cmake pkg-config libgtk-3-dev libxtst-dev
+sh build.sh
+./build/linux/ultimate-autoclicker
+# Testing and packaging additionally require:
+sudo apt install xvfb xauth rpm zip unzip cpio
+sh test.sh
+sh package.sh
+```
+
+`package.sh` runs the shared engine tests and real GTK/XTEST integration checks under Xvfb, then creates five package formats and checksums in `build/linux/`.
+RPM-based source builds need the equivalent GTK 3, X11, Xtst development packages, CMake, GCC, pkg-config, Xvfb, xauth, rpm-build, and zip.
+
+### Option A: Windows 1-Click Build Script (`build.bat`)
 If you have MinGW-w64 / GCC installed:
 1. Double-click `build.bat` in the project directory.
 2. The script compiles `assets/resource.rc` and builds `bin/UltimateAutoClicker.exe`.
@@ -170,7 +202,7 @@ The suite has two parts:
 
 ## Settings & Portability
 
-Everything is stored in `UltimateAutoClicker.ini` next to the executable. Delete that file to reset the app to its defaults. Nothing is written to the registry and no folders are created in AppData.
+On Windows, everything is stored in `UltimateAutoClicker.ini` next to the executable. Delete that file to reset the app to its defaults. Nothing is written to the registry and no folders are created in AppData. Linux uses the user configuration directory described above.
 
 <hr>
 

@@ -480,9 +480,14 @@ static void TestFixedPosition() {
     }
     CHECK_EQ((long long)sink.events.size(), 2);
     if (sink.events.size() == 2) {
+#ifdef _WIN32
         CHECK(sink.events[0].flags & MOUSEEVENTF_ABSOLUTE);
         CHECK(sink.events[0].flags & MOUSEEVENTF_VIRTUALDESK);
         CHECK(sink.events[0].flags & MOUSEEVENTF_MOVE);
+#else
+        CHECK(sink.events[0].flags & MOUSEEVENTF_LEFTDOWN);
+        CHECK(!(sink.events[0].flags & MOUSEEVENTF_MOVE));
+#endif
         CHECK(sink.events[1].flags & MOUSEEVENTF_LEFTUP);
     }
 }

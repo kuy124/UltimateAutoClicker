@@ -10,7 +10,11 @@
 #define _UNICODE
 #endif
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "linux_types.h"
+#endif
 #include <string>
 #include <vector>
 #include <atomic>

@@ -18,6 +18,7 @@ std::wstring Combo::Name() const {
     for (size_t i = 0; i < keys.size(); i++) {
         if (i) out += L" + ";
         wchar_t buf[64] = {0};
+#ifdef _WIN32
         LONG scan = MapVirtualKeyW(keys[i], MAPVK_VK_TO_VSC) << 16;
         switch (keys[i]) {
             case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
@@ -26,6 +27,11 @@ std::wstring Combo::Name() const {
                 scan |= 0x01000000; break;
         }
         GetKeyNameTextW(scan, buf, 64);
+#else
+        if (keys[i] >= 32 && keys[i] <= 126) { buf[0] = (wchar_t)keys[i]; }
+        else if (keys[i] >= 112 && keys[i] <= 135)
+            swprintf_s(buf, 64, L"F%d", keys[i] - 111);
+#endif
         if (buf[0]) out += buf; else { wchar_t t[16]; swprintf_s(t, 16, L"VK_%d", keys[i]); out += t; }
     }
     return out;
@@ -129,7 +135,7 @@ std::wstring EncodeConfig(const Config& c) {
     std::wstring s;
     wchar_t buf[256];
     auto add = [&](const wchar_t* k, long long v) {
-        swprintf_s(buf, 256, L"%s=%lld;", k, v);
+        swprintf_s(buf, 256, L"%ls=%lld;", k, v);
         s += buf;
     };
     add(L"interval_us", c.intervalUs);
@@ -442,12 +448,14 @@ void Engine::TickHold() {
         in.mi.dwExtraInfo = kInjectTag;
         if (usePos) {
             sink_.MoveCursor(x, y);
+#ifdef _WIN32
             int vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN), vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
             int vW = GetSystemMetrics(SM_CXVIRTUALSCREEN), vH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             LONG nx = (LONG)(((x - vLeft) * 65535LL) / (vW > 1 ? vW - 1 : 1));
             LONG ny = (LONG)(((y - vTop) * 65535LL) / (vH > 1 ? vH - 1 : 1));
             in.mi.dx = nx; in.mi.dy = ny;
             in.mi.dwFlags = down | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
+#endif
         }
         sink_.Send(&in, 1);
         holdDown_ = true;
@@ -497,6 +505,7 @@ void Engine::DoClick(const Config& c, int x, int y, bool usePos) {
 
     if (usePos) {
         sink_.MoveCursor(x, y);
+#ifdef _WIN32
         int vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN), vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
         int vW = GetSystemMetrics(SM_CXVIRTUALSCREEN), vH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         LONG nx = (LONG)(((x - vLeft) * 65535LL) / (vW > 1 ? vW - 1 : 1));
@@ -505,6 +514,10 @@ void Engine::DoClick(const Config& c, int x, int y, bool usePos) {
         inputs[0].mi.dwFlags = downFlag | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
         inputs[1].mi.dx = nx; inputs[1].mi.dy = ny;
         inputs[1].mi.dwFlags = upFlag   | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
+#else
+        inputs[0].mi.dwFlags = downFlag;
+        inputs[1].mi.dwFlags = upFlag;
+#endif
     } else {
         inputs[0].mi.dwFlags = downFlag;
         inputs[1].mi.dwFlags = upFlag;
