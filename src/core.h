@@ -21,6 +21,9 @@
 #include <mutex>
 namespace ac {
 
+constexpr int kEmergencyEdgePx = 5;
+bool IsScreenEdge(int x, int y, int left, int top, int right, int bottom);
+
 // ---------------------------------------------------------------- limits
 constexpr long long   kMinIntervalUs = 100;                            // 0.1 ms floor (anti spin-lock)
 constexpr long long   kMaxIntervalUs = 24LL * 3600LL * 1000000LL;      // 24 h
@@ -96,6 +99,7 @@ struct InputSink {
     virtual ~InputSink() {}
     virtual void Send(const INPUT* in, int count) = 0;
     virtual void MoveCursor(int x, int y) = 0;
+    virtual bool EmergencyStopRequested() { return false; }
 };
 
 enum { ST_IDLE = 0, ST_COUNTDOWN = 1, ST_RUNNING = 2 };
@@ -106,6 +110,7 @@ struct EngineStatus {
     unsigned long long elapsedUs = 0;
     long long intervalUs = 0;      // effective interval used by the last click
     int countdownSec = 0;          // whole seconds left in the start countdown
+    bool emergencyStopped = false; // stays visible until explicitly restarted
 };
 
 class Engine {
@@ -117,6 +122,7 @@ public:
 
     void Start();                   // begin the start countdown (no-op if busy)
     void Stop();                    // request an immediate stop (thread safe)
+    bool EmergencyStop();           // stop and latch the reason (thread safe)
     void Tick();                    // performs one step of work
     EngineStatus Status() const;
     unsigned long long ElapsedUs() const;
@@ -125,6 +131,7 @@ public:
 
 private:
     void TickCountdown();
+    bool ShouldStop();
     void TickRunning();
     void TickHold();
     void DoClick(const Config& c, int x, int y, bool usePos);

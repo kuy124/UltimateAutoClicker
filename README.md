@@ -18,6 +18,11 @@ Download **[UltimateAutoClicker.exe](https://github.com/kuy124/UltimateAutoClick
 
 The app runs without administrator permissions. To automate an app running as administrator, launch AutoClicker using **Run as administrator** too; Windows blocks normal apps from sending input to elevated apps.
 
+### What's new in 1.2.3
+* **Screen-edge emergency stop:** move the cursor to any monitor edge to stop automation, cancel countdowns, and release held buttons.
+* **Clear safety feedback:** a pulsing red border, click-through warning, and persistent stop status; restart manually when ready.
+* **Safer double clicks:** stopping during a click prevents the second press; programmed cursor moves do not trigger the emergency stop.
+
 ### What's new in 1.2.2
 * **Two platform editions:** Windows and Linux X11; Linux downloads include DEB, RPM, tar.gz, tar.xz, and ZIP packages, with SHA-256 checksums.
 * **Basic by default:** essential click controls with more space between settings.
@@ -27,13 +32,13 @@ The app runs without administrator permissions. To automate an app running as ad
 
 ### Download and build for Linux (X11)
 
-Get Linux packages from [release 1.2.2](https://github.com/kuy124/UltimateAutoClicker/releases/tag/1.2.2).
+Get Linux packages from [release 1.2.3](https://github.com/kuy124/UltimateAutoClicker/releases/tag/1.2.3).
 These packages target **x86-64 Linux**, built on Ubuntu 24.04 (glibc 2.39); build from source on older distributions.
 Choose `.deb` for Debian/Ubuntu, `.rpm` for RPM-based distributions, or `.tar.gz`, `.tar.xz`, or `.zip` for manual installation.
 Archives require GTK 3, libX11, and libXtst installed separately. Verify downloads with the accompanying `SHA256SUMS-linux.txt`.
 
 ```sh
-sudo apt install ./UltimateAutoClicker-1.2.2-Linux-x86_64.deb
+sudo apt install ./UltimateAutoClicker-1.2.3-Linux-x86_64.deb
 # Or extract an archive and run ./bin/ultimate-autoclicker
 ```
 
@@ -158,6 +163,11 @@ Run `build.bat` or `test.bat` from the project root. Launch the app from `bin/Ul
 
 <hr>
 
+### 10. Screen-edge Emergency Stop
+* Move the cursor into the outer **5 pixels of any monitor** to stop automation immediately, including countdowns and held buttons. Restart manually with **Start** or your hotkey.
+* A pulsing red screen border and click-through warning confirm the stop without stealing focus. The app keeps the stop reason visible, and reduced-motion settings disable animation.
+* Programmed cursor moves do not trigger the stop. Linux X11 uses cursor-position polling; desktops without a compositor show a compact warning instead of the full-screen border.
+
 ## How to Use
 
 1. **Set Interval:** Specify your interval across the time boxes and press **Enter** to commit. Use **$\mu\text{s}$** for sub-millisecond intervals.
@@ -195,8 +205,8 @@ test.bat
 
 The suite has two parts:
 
-* **153 engine unit checks** (`tests.exe`) run the click engine on a virtual clock: interval maths, the interval clamp, randomised intervals, drift free scheduling, double clicks, hold mode, sequence playback with per point delays, scrolling, auto typing, the hotkey matcher and the config codec. They also cover the regressions for the endless "repeat N" restart and the zero interval spin lock. The virtual clock keeps the results deterministic.
-* **520 GUI checks** (`guitest.exe --selftest`) drive the real window: Basic defaults, mode switching, Advanced tab navigation, visible control bounds, title, interval conversion, countdown cancellation, click count, settings round trip, profiles, modal dialogs, font scaling at 100%/150%/200%, button text fit, compact window size across DPI changes, and small-screen scrolling.
+* **200 engine unit checks** (`tests.exe`) run the click engine on a virtual clock: interval maths, the interval clamp, randomised intervals, drift free scheduling, double clicks, hold mode, sequence playback with per point delays, scrolling, auto typing, the hotkey matcher and the config codec. They also cover screen-edge stops, cancellation between double clicks, and the regressions for the endless "repeat N" restart and the zero interval spin lock. The virtual clock keeps the results deterministic.
+* **541 GUI checks** (`guitest.exe --selftest`) drive the real window: Basic defaults, mode switching, Advanced tab navigation, visible control bounds, title, interval conversion, countdown cancellation, click count, settings round trip, profiles, modal dialogs, font scaling at 100%/150%/200%, button text fit, compact window size across DPI changes, small-screen scrolling, and click-through emergency feedback while minimized.
 
 <hr>
 

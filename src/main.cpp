@@ -27,7 +27,7 @@ enum {
     ID_TOP_CHECK, ID_MAIN_BTN,
     ID_STAT_CLICKS,
     ID_PROF_COMBO, ID_PROF_SAVE, ID_PROF_LOAD, ID_PROF_DEL,
-    ID_UI_MODE, ID_UI_TABS,
+    ID_UI_MODE, ID_UI_TABS, ID_SAFETY_STATUS,
     ID_SEQ_LIST = 401, ID_SEQ_ADD_BTN, ID_SEQ_DEL_BTN, ID_SEQ_CLR_BTN,
     ID_SEQ_IN_X, ID_SEQ_IN_Y, ID_SEQ_IN_D, ID_SEQ_REC_BTN
 };
@@ -36,6 +36,7 @@ enum {
 #define WM_APP_PICK   (WM_APP + 2)
 #define WM_APP_REC    (WM_APP + 3)
 #define WM_APP_STATE  (WM_APP + 4)
+#define WM_APP_EMERGENCY (WM_APP + 5)
 
 #define IDI_APPICON 101
 
@@ -48,6 +49,10 @@ static InputSink* g_sink = nullptr;
 static HWND  g_mainWnd = nullptr;
 static HFONT g_font = nullptr, g_bold = nullptr;
 static HHOOK g_kbHook = nullptr, g_mouseHook = nullptr;
+static HHOOK g_emergencyMouseHook = nullptr;
+static HWND g_emergencyOverlay = nullptr;
+static ULONGLONG g_emergencyEffectStart = 0;
+static BOOL g_emergencyAnimate = TRUE;
 static HANDLE hWake = nullptr, hInterrupt = nullptr;
 static bool  g_running = true;
 static bool  g_periodActive = false;
@@ -115,7 +120,17 @@ struct WinClock : Clock {
 
 struct WinSink : InputSink {
     void Send(const INPUT* in, int count) override { SendInput(count, (LPINPUT)in, sizeof(INPUT)); }
-    void MoveCursor(int x, int y) override { SetCursorPos(x, y); }
+    void MoveCursor(int x, int y) override {
+        INPUT in = {};
+        in.type = INPUT_MOUSE;
+        in.mi.dx = (LONG)(((x - GetSystemMetrics(SM_XVIRTUALSCREEN)) * 65535LL) /
+            std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1));
+        in.mi.dy = (LONG)(((y - GetSystemMetrics(SM_YVIRTUALSCREEN)) * 65535LL) /
+            std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1));
+        in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        in.mi.dwExtraInfo = kInjectTag;
+        Send(&in, 1);
+    }
 };
 
 // ---------------------------------------------------------------- helpers
@@ -548,12 +563,133 @@ static void TimerResolutionOff() {
     }
 }
 
+// ---------------------------------------------------------------- emergency stop feedback
+static LRESULT CALLBACK EmergencyEffectProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const COLORREF transparent = RGB(1, 2, 3);
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_TIMER) {
+        ULONGLONG elapsed = GetTickCount64() - g_emergencyEffectStart;
+        if (elapsed >= 2500) { KillTimer(hwnd, 1); ShowWindow(hwnd, SW_HIDE); return 0; }
+        int pulse = (int)(elapsed % 800);
+        if (pulse > 400) pulse = 800 - pulse;
+        int alpha = g_emergencyAnimate ? 170 + pulse * 65 / 400 : 235;
+        if (g_emergencyAnimate && elapsed > 2000) alpha = alpha * (2500 - elapsed) / 500;
+        SetLayeredWindowAttributes(hwnd, transparent, (BYTE)alpha, LWA_COLORKEY | LWA_ALPHA);
+        return 0;
+    }
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC paint = BeginPaint(hwnd, &ps);
+        RECT r; GetClientRect(hwnd, &r);
+        HDC dc = CreateCompatibleDC(paint);
+        HBITMAP bitmap = CreateCompatibleBitmap(paint, r.right, r.bottom);
+        if (!dc || !bitmap) {
+            if (dc) DeleteDC(dc);
+            if (bitmap) DeleteObject(bitmap);
+            EndPaint(hwnd, &ps); return 0;
+        }
+        HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+        HBRUSH background = CreateSolidBrush(transparent);
+        FillRect(dc, &r, background); DeleteObject(background);
+        UINT dpi = WindowDpi(hwnd);
+        auto px = [dpi](int n) { return MulDiv(n, dpi, 96); };
+        HPEN glow = CreatePen(PS_SOLID, px(12), RGB(100, 20, 38));
+        HGDIOBJ oldPen = SelectObject(dc, glow);
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(dc, px(6), px(6), r.right - px(6), r.bottom - px(6));
+        HPEN red = CreatePen(PS_SOLID, px(3), RGB(255, 75, 100));
+        SelectObject(dc, red); DeleteObject(glow);
+        Rectangle(dc, px(6), px(6), r.right - px(6), r.bottom - px(6));
+        int width = std::min(px(460), std::max(1, (int)r.right - px(32)));
+        RECT card = {(r.right - width) / 2, px(24), (r.right + width) / 2, px(134)};
+        HBRUSH fill = CreateSolidBrush(RGB(31, 18, 25));
+        SelectObject(dc, fill);
+        RoundRect(dc, card.left, card.top, card.right, card.bottom, px(16), px(16));
+        HFONT title = CreateFontW(px(22), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+        HFONT body = CreateFontW(px(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+        HGDIOBJ oldFont = SelectObject(dc, title);
+        SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(255, 255, 255));
+        RECT text = {card.left + px(16), card.top + px(15), card.right - px(16), card.top + px(45)};
+        DrawTextW(dc, L"EMERGENCY STOP", -1, &text, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, body);
+        text.top = card.top + px(56); text.bottom = card.bottom - px(10);
+        std::wstring message = L"All clicks stopped. Use Start";
+        if (!g_cfg.hotkey.empty()) message += L" or " + g_cfg.hotkey.Name();
+        message += L" to restart.";
+        DrawTextW(dc, message.c_str(), -1, &text, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+        BitBlt(paint, 0, 0, r.right, r.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, oldFont); SelectObject(dc, oldPen); SelectObject(dc, oldBrush);
+        DeleteObject(title); DeleteObject(body); DeleteObject(red); DeleteObject(fill);
+        SelectObject(dc, oldBitmap); DeleteObject(bitmap); DeleteDC(dc);
+        EndPaint(hwnd, &ps); return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowEmergencyEffect(POINT point) {
+    MONITORINFO monitor = {sizeof(monitor)};
+    if (!GetMonitorInfoW(MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST), &monitor)) return;
+    if (!g_emergencyOverlay) {
+        WNDCLASSW wc = {};
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpfnWndProc = EmergencyEffectProc;
+        wc.lpszClassName = L"AutoClickerEmergencyStop";
+        RegisterClassW(&wc);
+        g_emergencyOverlay = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST, wc.lpszClassName, L"EMERGENCY STOP - all clicks stopped",
+            WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+    }
+    if (!g_emergencyOverlay) return;
+    g_emergencyEffectStart = GetTickCount64();
+    g_emergencyAnimate = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &g_emergencyAnimate, 0);
+    SetLayeredWindowAttributes(g_emergencyOverlay, RGB(1, 2, 3), 235, LWA_COLORKEY | LWA_ALPHA);
+    RECT r = monitor.rcMonitor;
+    SetWindowPos(g_emergencyOverlay, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_emergencyOverlay, nullptr, FALSE);
+    SetTimer(g_emergencyOverlay, 1, 16, nullptr);
+}
+
+static bool PointAtScreenEdge(POINT point) {
+    MONITORINFO monitor = {sizeof(monitor)};
+    return GetMonitorInfoW(MonitorFromPoint(point, MONITOR_DEFAULTTONULL), &monitor) &&
+        IsScreenEdge(point.x, point.y, monitor.rcMonitor.left, monitor.rcMonitor.top,
+            monitor.rcMonitor.right, monitor.rcMonitor.bottom);
+}
+
+static void HandleEmergencyMotion(POINT point, bool injected) {
+    if (!injected && !g_pickMode && g_engine && g_engine->IsRunning() && PointAtScreenEdge(point) &&
+        g_engine->EmergencyStop()) {
+        SetEvent(hInterrupt);
+        PostMessageW(g_mainWnd, WM_APP_EMERGENCY, (WPARAM)point.x, (LPARAM)point.y);
+    }
+}
+
+static LRESULT CALLBACK EmergencyMouseHookProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code >= 0 && wParam == WM_MOUSEMOVE) {
+        auto* mouse = (MSLLHOOKSTRUCT*)lParam;
+        HandleEmergencyMotion(mouse->pt, (mouse->flags & LLMHF_INJECTED) || mouse->dwExtraInfo == kInjectTag);
+    }
+    return CallNextHookEx(g_emergencyMouseHook, code, wParam, lParam);
+}
+
 static void ToggleClicking() {
     if (!g_engine) return;
     if (g_engine->IsRunning()) {
         g_engine->Stop();
         SetEvent(hInterrupt);
     } else {
+        if (!g_emergencyMouseHook) {
+            MessageBoxW(g_mainWnd, L"The screen-edge emergency stop could not be enabled.\nRestart the app before starting clicks.",
+                L"Emergency stop unavailable", MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (g_emergencyOverlay) { KillTimer(g_emergencyOverlay, 1); ShowWindow(g_emergencyOverlay, SW_HIDE); }
         ApplyUiToConfig();
         g_engine->ApplyConfig(g_cfg);
         TimerResolutionOn();
@@ -581,6 +717,9 @@ static void UpdateStats() {
     wchar_t buf[64];
     swprintf_s(buf, 64, L"%d", st.clicksDone);
     SetText(GetDlgItem(g_mainWnd, ID_STAT_CLICKS), L"Clicks: " + std::wstring(buf));
+    SetText(GetDlgItem(g_mainWnd, ID_SAFETY_STATUS), st.emergencyStopped ?
+        L"EMERGENCY STOP - all clicks stopped. Restart manually." : g_emergencyMouseHook ?
+        L"Emergency stop: move the cursor to any screen edge." : L"Screen-edge stop unavailable. Clicking is disabled.");
 
     bool busy = st.state != ST_IDLE;
     if (busy != g_lastBusy) {
@@ -1054,6 +1193,7 @@ static void LayoutMain(HWND hwnd) {
             else { x = 28 + (id - ID_PROF_SAVE) * 150; y = top[UI_PROFILES] + 60; w = 138; }
         }
         if (id == ID_TOP_CHECK) { x = 320; y = top[UI_FOOTER] + 8; w = 158; }
+        if (id == ID_SAFETY_STATUS) { x = 22; y = top[UI_FOOTER] + 24; w = 456; h = 18; }
         if (id == ID_MAIN_BTN) { x = 16; y = top[UI_FOOTER] + 42; w = 468; h = 48; }
         SetWindowPos(c.hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         ShowWindow(c.hwnd, visible ? SW_SHOW : SW_HIDE);
@@ -1187,6 +1327,7 @@ static void BuildUi(HWND hwnd) {
     // --- status
     section = UI_FOOTER;
     Add(L"STATIC", L"Clicks: 0", 0, 22, 596, 170, 20, ID_STAT_CLICKS);
+    Add(L"STATIC", L"Emergency stop: move the cursor to any screen edge.", 0, 22, 612, 456, 18, ID_SAFETY_STATUS);
     Add(L"BUTTON", L"Always on Top", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 620, 180, 20, ID_TOP_CHECK);
     Add(L"BUTTON", L"START CLICKING (F6)", BS_PUSHBUTTON | WS_TABSTOP, 10, 650, 540, 36, ID_MAIN_BTN, g_bold);
 
@@ -1239,11 +1380,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             RefreshProfileCombo();
             TrayAdd();
             SetTimer(hwnd, 1, 100, nullptr);
+            g_emergencyMouseHook = SetWindowsHookExW(WH_MOUSE_LL, EmergencyMouseHookProc, GetModuleHandleW(nullptr), 0);
+            UpdateStats();
             break;
         }
         case WM_TIMER: {
             UpdateButton();
             UpdateStats();
+            break;
+        }
+        case WM_APP_EMERGENCY: {
+            if (!g_engine->Status().emergencyStopped) break;
+            ShowEmergencyEffect({(LONG)wParam, (LONG)lParam});
+            TimerResolutionOff();
+            UpdateButton(); UpdateStats();
             break;
         }
         case WM_APP_STATE: {
@@ -1437,6 +1587,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         }
         case WM_CTLCOLORSTATIC: {
+            if ((HWND)lParam == GetDlgItem(hwnd, ID_SAFETY_STATUS)) {
+                HIGHCONTRASTW contrast = {sizeof(contrast)};
+                SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0);
+                SetTextColor((HDC)wParam, g_engine->Status().emergencyStopped && !(contrast.dwFlags & HCF_HIGHCONTRASTON) ?
+                    RGB(170, 25, 50) : GetSysColor(COLOR_BTNTEXT));
+                SetBkMode((HDC)wParam, TRANSPARENT);
+                return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+            }
             if ((HWND)lParam == GetDlgItem(hwnd, ID_WARN_STATIC)) {
                 HIGHCONTRASTW contrast = {sizeof(contrast)};
                 SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0);
@@ -1457,6 +1615,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_running = false;
             if (g_engine && g_engine->IsRunning()) { g_engine->Stop(); SetEvent(hInterrupt); }
             KillTimer(hwnd, 1);
+            if (g_emergencyOverlay) { DestroyWindow(g_emergencyOverlay); g_emergencyOverlay = nullptr; }
+            if (g_emergencyMouseHook) { UnhookWindowsHookEx(g_emergencyMouseHook); g_emergencyMouseHook = nullptr; }
             TrayRemove();
             if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
             if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
@@ -1747,6 +1907,51 @@ static int RunSelfTest(HWND hwnd) {
         ST_CHECK(g_profiles.size() == 1 && g_profiles[0] == L"SelfTest", "a profile is saved");
         SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_PROF_DEL, 0);
         ST_CHECK(g_profiles.empty(), "a profile is deleted");
+    }
+
+    // --- screen-edge safety uses the real worker, hook and non-activating overlay
+    SelfTestLog("- screen-edge emergency stop\n");
+    {
+        ST_CHECK(g_emergencyMouseHook != nullptr, "the screen-edge mouse hook is installed");
+        ST_CHECK(IsWindowVisible(GetDlgItem(hwnd, ID_SAFETY_STATUS)), "the emergency-stop hint is visible");
+        MONITORINFO monitor = {sizeof(monitor)};
+        GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor);
+        POINT center = {(monitor.rcMonitor.left + monitor.rcMonitor.right) / 2,
+            (monitor.rcMonitor.top + monitor.rcMonitor.bottom) / 2};
+        POINT edge = {monitor.rcMonitor.left, center.y}, original;
+        GetCursorPos(&original);
+        SetDlgItemTextW(hwnd, ID_DELAY_EDIT, L"5");
+        SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_MAIN_BTN, 0);
+        PumpMessages(40);
+        HandleEmergencyMotion(center, false);
+        HandleEmergencyMotion(edge, true);
+        WinSink cursor;
+        cursor.MoveCursor(edge.x, edge.y);
+        PumpMessages(100);
+        ST_CHECK(g_engine->Status().state == ST_COUNTDOWN, "injected edge moves do not stop the countdown");
+        ShowWindow(hwnd, SW_MINIMIZE);
+        PumpMessages(40);
+        HandleEmergencyMotion(edge, false);
+        PumpMessages(100);
+        ST_CHECK(!g_engine->IsRunning() && g_engine->Status().emergencyStopped, "physical edge movement cancels the worker");
+        ST_CHECK(g_engine->Status().clicksDone == 0, "edge cancellation sends no clicks during countdown");
+        ST_CHECK(IsWindowVisible(g_emergencyOverlay), "the emergency-stop visual is shown");
+        ST_CHECK(IsIconic(hwnd) && GetWindow(g_emergencyOverlay, GW_OWNER) == nullptr,
+            "the warning remains independent of the minimized main window");
+        LONG_PTR style = GetWindowLongPtrW(g_emergencyOverlay, GWL_EXSTYLE);
+        ST_CHECK((style & (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)) ==
+            (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE), "the visual is transparent to clicks and cannot activate");
+        ST_CHECK(GetForegroundWindow() != g_emergencyOverlay, "the warning does not steal focus");
+        ST_CHECK(GetText(hwnd, ID_SAFETY_STATUS).find(L"EMERGENCY STOP") != std::wstring::npos, "the stop reason stays visible in the app");
+        ShowWindow(hwnd, SW_RESTORE);
+        cursor.MoveCursor(original.x, original.y);
+        PumpMessages(2600);
+        ST_CHECK(!IsWindowVisible(g_emergencyOverlay) && g_engine->Status().emergencyStopped, "the visual expires without clearing the stop reason");
+        SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_MAIN_BTN, 0);
+        PumpMessages(40);
+        ST_CHECK(g_engine->IsRunning() && !g_engine->Status().emergencyStopped, "only an explicit restart clears the emergency stop");
+        SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_MAIN_BTN, 0);
+        PumpMessages(40);
     }
 
     // --- the countdown can be cancelled

@@ -11,5 +11,5 @@ jobs:
         with:
           name: linux-x86_64
           path: |
-            build/linux/UltimateAutoClicker-1.2.2-Linux-*
+            build/linux/UltimateAutoClicker-*-Linux-*
             build/linux/SHA256SUMS-linux.txt

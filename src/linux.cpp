@@ -32,10 +32,31 @@ struct LinuxClock : Clock {
 
 struct XInput : InputSink {
     Display* display;
+    std::mutex cursorMutex;
+    std::vector<GdkRectangle> screens;
+    int cursorX = 0, cursorY = 0;
+    bool movedCursor = false;
     explicit XInput(Display* d) : display(d) {}
+    bool Cursor(int& x, int& y) {
+        Window root, child; int localX, localY; unsigned mask;
+        return XQueryPointer(display, DefaultRootWindow(display), &root, &child,
+            &x, &y, &localX, &localY, &mask);
+    }
+    bool EmergencyStopRequested() override {
+        std::lock_guard<std::mutex> lock(cursorMutex);
+        int x, y;
+        if (!Cursor(x, y)) return false;
+        // ponytail: X11 position polling; raw motion if movement onto an injected target must be distinguished.
+        if (movedCursor && x == cursorX && y == cursorY) return false;
+        movedCursor = false;
+        for (const auto& r : screens)
+            if (IsScreenEdge(x, y, r.x, r.y, r.x + r.width, r.y + r.height)) return true;
+        return false;
+    }
     void MoveCursor(int x, int y) override {
+        std::lock_guard<std::mutex> lock(cursorMutex);
         XTestFakeMotionEvent(display, -1, x, y, CurrentTime);
-        XFlush(display);
+        movedCursor = Cursor(cursorX, cursorY);
     }
     void Send(const INPUT* inputs, int count) override {
         for (int i = 0; i < count; ++i) {
@@ -67,7 +88,12 @@ struct App {
     XInput sink;
     Engine engine;
     GtkWidget *window, *interval, *button, *kind, *mode, *action, *limit, *delay,
-        *fixed, *x, *y, *random, *minimum, *maximum, *hold, *top, *start, *status;
+        *fixed, *x, *y, *random, *minimum, *maximum, *hold, *top, *start, *status, *safety;
+    GtkWidget* emergencyOverlay = nullptr;
+    guint effectTimer = 0;
+    gint64 effectStarted = 0;
+    bool emergencyShown = false, fullScreenEffect = false;
+    gboolean animateEffect = TRUE;
     GKeyFile* settings = g_key_file_new();
     gchar* path = nullptr;
     std::thread worker;
@@ -76,6 +102,103 @@ struct App {
     bool quit = false;
     bool hotkeyDown = false;
     explicit App(Display* display) : sink(display), engine(clock, sink) {}
+    void RefreshScreens() {
+        GdkDisplay* desktop = gdk_display_get_default();
+        std::lock_guard<std::mutex> lock(sink.cursorMutex);
+        sink.screens.clear();
+        for (int i = 0; i < gdk_display_get_n_monitors(desktop); ++i) {
+            GdkMonitor* monitor = gdk_display_get_monitor(desktop, i);
+            GdkRectangle r; gdk_monitor_get_geometry(monitor, &r);
+            int scale = gdk_monitor_get_scale_factor(monitor);
+            r.x *= scale; r.y *= scale; r.width *= scale; r.height *= scale;
+            sink.screens.push_back(r);
+        }
+    }
+    void ShowEmergencyEffect() {
+        GdkScreen* screen = gtk_widget_get_screen(window);
+        if (!emergencyOverlay) {
+            emergencyOverlay = gtk_window_new(GTK_WINDOW_POPUP);
+            gtk_window_set_title(GTK_WINDOW(emergencyOverlay), "EMERGENCY STOP - all clicks stopped");
+            gtk_window_set_keep_above(GTK_WINDOW(emergencyOverlay), TRUE);
+            gtk_window_set_accept_focus(GTK_WINDOW(emergencyOverlay), FALSE);
+            gtk_window_set_focus_on_map(GTK_WINDOW(emergencyOverlay), FALSE);
+            gtk_window_set_skip_taskbar_hint(GTK_WINDOW(emergencyOverlay), TRUE);
+            gtk_widget_set_app_paintable(emergencyOverlay, TRUE);
+            GdkVisual* visual = gdk_screen_get_rgba_visual(screen);
+            fullScreenEffect = visual && gdk_screen_is_composited(screen);
+            if (visual) gtk_widget_set_visual(emergencyOverlay, visual);
+            auto* toast = gtk_label_new(nullptr);
+            gtk_label_set_markup(GTK_LABEL(toast), "<b>EMERGENCY STOP</b>\nAll clicks stopped. Use Start or F6 to restart.");
+            gtk_label_set_justify(GTK_LABEL(toast), GTK_JUSTIFY_CENTER);
+            gtk_label_set_line_wrap(GTK_LABEL(toast), TRUE);
+            gtk_widget_set_halign(toast, GTK_ALIGN_CENTER);
+            gtk_widget_set_valign(toast, GTK_ALIGN_START);
+            gtk_widget_set_margin_top(toast, fullScreenEffect ? 24 : 0);
+            GtkCssProvider* css = gtk_css_provider_new();
+            gtk_css_provider_load_from_data(css,
+                "label { background: #211219; color: white; border: 2px solid #ff4b64;"
+                " border-radius: 12px; padding: 18px 24px; font-size: 16px; }", -1, nullptr);
+            gtk_style_context_add_provider(gtk_widget_get_style_context(toast), GTK_STYLE_PROVIDER(css),
+                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+            g_object_unref(css);
+            gtk_container_add(GTK_CONTAINER(emergencyOverlay), toast);
+            g_signal_connect(emergencyOverlay, "draw", G_CALLBACK(+[](GtkWidget* widget, cairo_t* cr, gpointer data) -> gboolean {
+                auto& a = *static_cast<App*>(data);
+                cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+                cairo_set_source_rgba(cr, 0.13, 0.07, 0.10, a.fullScreenEffect ? 0 : 1);
+                cairo_paint(cr); cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+                if (a.fullScreenEffect) {
+                    cairo_set_source_rgba(cr, 1, 0.29, 0.39, 1);
+                    cairo_set_line_width(cr, 6);
+                    cairo_rectangle(cr, 3, 3, gtk_widget_get_allocated_width(widget) - 6,
+                        gtk_widget_get_allocated_height(widget) - 6);
+                    cairo_stroke(cr);
+                }
+                return FALSE;
+            }), this);
+            gtk_widget_realize(emergencyOverlay);
+            gdk_window_set_pass_through(gtk_widget_get_window(emergencyOverlay), TRUE);
+        }
+        int px, py;
+        gdk_device_get_position(gdk_seat_get_pointer(gdk_display_get_default_seat(gdk_display_get_default())),
+            nullptr, &px, &py);
+        GdkRectangle r;
+        gdk_monitor_get_geometry(gdk_display_get_monitor_at_point(gdk_display_get_default(), px, py), &r);
+        int width = fullScreenEffect ? r.width : std::min(460, r.width);
+        int height = fullScreenEffect ? r.height : 110;
+        gtk_widget_set_size_request(emergencyOverlay, width, height);
+        gtk_window_resize(GTK_WINDOW(emergencyOverlay), width, height);
+        gtk_window_move(GTK_WINDOW(emergencyOverlay), r.x + (r.width - width) / 2, r.y + (fullScreenEffect ? 0 : 24));
+        animateEffect = TRUE;
+        g_object_get(gtk_settings_get_default(), "gtk-enable-animations", &animateEffect, nullptr);
+        effectStarted = g_get_monotonic_time();
+        gtk_widget_set_opacity(emergencyOverlay, 0.92);
+        gtk_widget_show_all(emergencyOverlay);
+        if (effectTimer) g_source_remove(effectTimer);
+        effectTimer = g_timeout_add(16, +[](gpointer data) -> gboolean {
+            auto& a = *static_cast<App*>(data);
+            gint64 elapsed = (g_get_monotonic_time() - a.effectStarted) / 1000;
+            if (elapsed >= 2500) {
+                gtk_widget_hide(a.emergencyOverlay); a.effectTimer = 0; return G_SOURCE_REMOVE;
+            }
+            if (a.animateEffect) {
+                int pulse = elapsed % 800;
+                if (pulse > 400) pulse = 800 - pulse;
+                double opacity = (170 + pulse * 65 / 400) / 255.0;
+                if (elapsed > 2000) opacity *= (2500 - elapsed) / 500.0;
+                gtk_widget_set_opacity(a.emergencyOverlay, opacity);
+            }
+            return G_SOURCE_CONTINUE;
+        }, this);
+    }
+    void CheckEmergency() {
+        if (engine.IsRunning() && sink.EmergencyStopRequested()) { engine.EmergencyStop(); clock.Interrupt(); }
+        if (engine.Status().emergencyStopped && !emergencyShown) {
+            emergencyShown = true;
+            gtk_label_set_markup(GTK_LABEL(safety), "<b>EMERGENCY STOP</b> — all clicks stopped.\nUse Start or F6 to restart.");
+            ShowEmergencyEffect();
+        }
+    }
     Config Read() {
         Config c;
         c.intervalUs = gtk_spin_button_get_value(GTK_SPIN_BUTTON(interval));
@@ -98,6 +221,12 @@ struct App {
     void Toggle() {
         if (engine.IsRunning()) { engine.Stop(); clock.Interrupt(); }
         else {
+            emergencyShown = false;
+            if (effectTimer) { g_source_remove(effectTimer); effectTimer = 0; }
+            if (emergencyOverlay) gtk_widget_hide(emergencyOverlay);
+            gtk_label_set_text(GTK_LABEL(safety), "Emergency stop: move the cursor to any screen edge.");
+            RefreshScreens();
+            { std::lock_guard<std::mutex> lock(sink.cursorMutex); sink.movedCursor = false; }
             std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
             if (!lock.owns_lock()) return;
             engine.ApplyConfig(Read()); engine.Start(); wake.notify_one();
@@ -132,7 +261,7 @@ struct App {
             }
         }
         window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-        gtk_window_set_title(GTK_WINDOW(window), "Ultimate AutoClicker 1.2.2 — Linux X11");
+        gtk_window_set_title(GTK_WINDOW(window), "Ultimate AutoClicker 1.2.3 — Linux X11");
         gtk_window_set_default_size(GTK_WINDOW(window), 460, 620);
         gtk_container_set_border_width(GTK_CONTAINER(window), 16);
         auto* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
@@ -199,6 +328,13 @@ struct App {
         gtk_box_pack_start(GTK_BOX(box), start, FALSE, FALSE, 0);
         status = gtk_label_new("Idle • Clicks: 0");
         gtk_box_pack_start(GTK_BOX(box), status, FALSE, FALSE, 0);
+        safety = gtk_label_new("Emergency stop: move the cursor to any screen edge.");
+        gtk_label_set_line_wrap(GTK_LABEL(safety), TRUE);
+        gtk_box_pack_start(GTK_BOX(box), safety, FALSE, FALSE, 0);
+        RefreshScreens();
+        auto monitorChanged = +[](GdkDisplay*, GdkMonitor*, gpointer data) { static_cast<App*>(data)->RefreshScreens(); };
+        g_signal_connect(gdk_display_get_default(), "monitor-added", G_CALLBACK(monitorChanged), this);
+        g_signal_connect(gdk_display_get_default(), "monitor-removed", G_CALLBACK(monitorChanged), this);
         g_signal_connect(start, "clicked", G_CALLBACK(+[](GtkButton*, gpointer data) { static_cast<App*>(data)->Toggle(); }), this);
         g_signal_connect(window, "delete-event", G_CALLBACK(+[](GtkWidget*, GdkEvent*, gpointer data) -> gboolean {
             static_cast<App*>(data)->Save(); return FALSE;
@@ -215,6 +351,9 @@ struct App {
         gtk_widget_show_all(window);
     }
     void Shutdown() {
+        g_signal_handlers_disconnect_by_data(gdk_display_get_default(), this);
+        if (effectTimer) { g_source_remove(effectTimer); effectTimer = 0; }
+        if (emergencyOverlay) { gtk_widget_destroy(emergencyOverlay); emergencyOverlay = nullptr; }
         engine.Stop(); clock.Interrupt();
         { std::lock_guard<std::mutex> lock(mutex); quit = true; }
         wake.notify_one();
@@ -293,13 +432,42 @@ static int SelfTest(App& app) {
     app.Toggle();
     for (int i = 0; i < 100 && app.engine.IsRunning(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     check(!app.engine.IsRunning(), "GUI stop cancels worker countdown");
+    GdkRectangle bounds = app.sink.screens.front();
+    int centerX = bounds.x + bounds.width / 2, centerY = bounds.y + bounds.height / 2;
+    int oldX = centerX, oldY = centerY; app.sink.Cursor(oldX, oldY);
+    auto move = [&](int x, int y) {
+        XWarpPointer(d, None, DefaultRootWindow(d), 0, 0, 0, 0, x, y); XSync(d, False);
+    };
+    auto pump = [&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        while (g_main_context_iteration(nullptr, FALSE)) {}
+    };
+    move(centerX, centerY);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(app.delay), 5);
+    app.Toggle(); pump();
+    app.sink.MoveCursor(bounds.x, centerY);
+    app.CheckEmergency();
+    check(app.engine.Status().state == ST_COUNTDOWN, "programmed edge moves do not emergency-stop");
+    move(centerX, centerY); app.CheckEmergency();
+    move(bounds.x, centerY); app.CheckEmergency(); pump();
+    check(!app.engine.IsRunning() && app.engine.Status().emergencyStopped, "screen-edge movement cancels the worker countdown");
+    check(app.engine.Status().clicksDone == 0, "screen-edge stop sends no clicks during countdown");
+    check(app.emergencyOverlay && gtk_widget_get_visible(app.emergencyOverlay), "emergency visual is shown");
+    check(gdk_window_get_pass_through(gtk_widget_get_window(app.emergencyOverlay)), "emergency visual passes clicks through");
+    check(!gtk_window_get_accept_focus(GTK_WINDOW(app.emergencyOverlay)), "emergency visual cannot steal focus");
+    check(std::strstr(gtk_label_get_text(GTK_LABEL(app.safety)), "EMERGENCY STOP"), "persistent emergency-stop text");
+    app.effectStarted = g_get_monotonic_time() - 2600000; pump();
+    check(!gtk_widget_get_visible(app.emergencyOverlay) && app.engine.Status().emergencyStopped, "visual expires but stop remains latched");
+    move(centerX, centerY); app.Toggle(); pump();
+    check(app.engine.IsRunning() && !app.engine.Status().emergencyStopped, "manual restart clears emergency-stop state");
+    app.Toggle(); pump(); move(oldX, oldY);
     std::printf("Linux integration: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
 
 int main(int argc, char** argv) {
     bool selftest = argc == 2 && std::strcmp(argv[1], "--selftest") == 0;
-    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) { std::puts("Ultimate AutoClicker 1.2.2 (Linux X11)"); return 0; }
+    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) { std::puts("Ultimate AutoClicker 1.2.3 (Linux X11)"); return 0; }
     if (!selftest && g_strcmp0(g_getenv("XDG_SESSION_TYPE"), "wayland") == 0) {
         std::fputs("Native Wayland automation is unsupported. Log into an X11/Xorg session.\n", stderr); return 1;
     }
@@ -315,9 +483,12 @@ int main(int argc, char** argv) {
     }
     App app(display); app.Build();
     int result = 0;
-    guint timer = 0;
+    guint timer = 0, safetyTimer = 0;
     if (selftest) result = SelfTest(app);
     else {
+        safetyTimer = g_timeout_add(10, +[](gpointer data) -> gboolean {
+            static_cast<App*>(data)->CheckEmergency(); return G_SOURCE_CONTINUE;
+        }, &app);
         timer = g_timeout_add(50, +[](gpointer data) -> gboolean {
             auto& a = *static_cast<App*>(data);
             char keys[32]; XQueryKeymap(a.sink.display, keys);
@@ -333,6 +504,7 @@ int main(int argc, char** argv) {
         gtk_main();
     }
     if (timer) g_source_remove(timer);
+    if (safetyTimer) g_source_remove(safetyTimer);
     app.Shutdown(); XCloseDisplay(display);
     return result;
 }

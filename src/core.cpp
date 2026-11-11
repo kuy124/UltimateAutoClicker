@@ -8,6 +8,12 @@
 
 namespace ac {
 
+bool IsScreenEdge(int x, int y, int left, int top, int right, int bottom) {
+    return x >= left && x < right && y >= top && y < bottom &&
+        (x - left < kEmergencyEdgePx || right - x <= kEmergencyEdgePx ||
+         y - top < kEmergencyEdgePx || bottom - y <= kEmergencyEdgePx);
+}
+
 // ---------------------------------------------------------------- hotkey
 std::wstring Combo::Name() const {
     std::wstring out;
@@ -280,6 +286,7 @@ void Engine::Start() {
     status_.elapsedUs = 0;
     status_.intervalUs = 0;
     status_.countdownSec = 0;
+    status_.emergencyStopped = false;
     if (cfg_.startDelaySec > 0) {
         status_.state = ST_COUNTDOWN;
         status_.countdownSec = cfg_.startDelaySec;
@@ -294,6 +301,19 @@ void Engine::Start() {
 
 void Engine::Stop() {
     stopRequested_ = true;
+}
+
+bool Engine::EmergencyStop() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (status_.state == ST_IDLE || status_.emergencyStopped || stopRequested_.load()) return false;
+    status_.emergencyStopped = true;
+    stopRequested_ = true;
+    return true;
+}
+
+bool Engine::ShouldStop() {
+    if (!stopRequested_.load() && sink_.EmergencyStopRequested()) EmergencyStop();
+    return stopRequested_.load();
 }
 
 void Engine::Finish() {
@@ -338,6 +358,7 @@ long long Engine::DelayForPoint(const Config& c) {
 void Engine::Tick() {
     int st;
     { std::lock_guard<std::mutex> lk(mtx_); st = status_.state; }
+    if (st != ST_IDLE && ShouldStop()) { Finish(); return; }
     switch (st) {
         case ST_COUNTDOWN: TickCountdown(); break;
         case ST_RUNNING:   TickRunning();   break;
@@ -346,7 +367,6 @@ void Engine::Tick() {
 }
 
 void Engine::TickCountdown() {
-    if (stopRequested_.load()) { Finish(); return; }
     unsigned long long now = clock_.NowUs();
     if (now >= countdownEndUs_) {
         {
@@ -404,7 +424,7 @@ void Engine::TickRunning() {
         else nextDueUs_ = now;
     }
 
-    if (stopRequested_.load()) { Finish(); return; }
+    if (ShouldStop()) { Finish(); return; }
 
     // act
     if (c.action == ACT_TYPE)        DoType(c);
@@ -425,7 +445,7 @@ void Engine::TickRunning() {
         if (done >= c.maxClicks) { Finish(); return; }
     }
     if (c.clickMode == MODE_SINGLE) { Finish(); return; }
-    if (stopRequested_.load()) { Finish(); return; }
+    if (ShouldStop()) { Finish(); return; }
 }
 
 void Engine::TickHold() {
@@ -465,7 +485,7 @@ void Engine::TickHold() {
 
     bool release = false;
     if (c.clickHoldUs > 0 && clock_.NowUs() - startedAtUs_ >= (unsigned long long)c.clickHoldUs) release = true;
-    if (stopRequested_.load()) release = true;
+    if (ShouldStop()) release = true;
 
     if (!release) {
         clock_.WaitUntilUs(clock_.NowUs() + 10000ULL, &stopRequested_);
@@ -487,7 +507,7 @@ void Engine::TickHold() {
     { std::lock_guard<std::mutex> lk(mtx_); status_.clicksDone++; n = status_.clicksDone; }
     if (c.maxClicks > 0 && n >= c.maxClicks) { Finish(); return; }
     if (c.clickMode == MODE_SINGLE) { Finish(); return; }
-    if (stopRequested_.load()) { Finish(); return; }
+    if (ShouldStop()) { Finish(); return; }
     // hold for a fixed time and repeat: wait one interval before the next press
     long long waitUs = EffectiveInterval(c);
     nextDueUs_ = clock_.NowUs() + (unsigned long long)waitUs;
@@ -495,6 +515,7 @@ void Engine::TickHold() {
 }
 
 void Engine::DoClick(const Config& c, int x, int y, bool usePos) {
+    if (ShouldStop()) return;
     DWORD downFlag = MOUSEEVENTF_LEFTDOWN, upFlag = MOUSEEVENTF_LEFTUP;
     if (c.mouseBtn == BTN_RIGHT)      { downFlag = MOUSEEVENTF_RIGHTDOWN;  upFlag = MOUSEEVENTF_RIGHTUP; }
     else if (c.mouseBtn == BTN_MIDDLE){ downFlag = MOUSEEVENTF_MIDDLEDOWN; upFlag = MOUSEEVENTF_MIDDLEUP; }
@@ -528,7 +549,7 @@ void Engine::DoClick(const Config& c, int x, int y, bool usePos) {
 
     if (holdUs <= 0) {
         sink_.Send(inputs, 2);
-        if (c.clickType == CL_DOUBLE) sink_.Send(inputs, 2);
+        if (c.clickType == CL_DOUBLE && !ShouldStop()) sink_.Send(inputs, 2);
         return;
     }
     sink_.Send(&inputs[0], 1);
@@ -536,6 +557,7 @@ void Engine::DoClick(const Config& c, int x, int y, bool usePos) {
     sink_.Send(&inputs[1], 1);
     if (c.clickType == CL_DOUBLE) {
         clock_.WaitUntilUs(clock_.NowUs() + (unsigned long long)holdUs, &stopRequested_);
+        if (ShouldStop()) return;
         sink_.Send(&inputs[0], 1);
         clock_.WaitUntilUs(clock_.NowUs() + (unsigned long long)holdUs, &stopRequested_);
         sink_.Send(&inputs[1], 1);

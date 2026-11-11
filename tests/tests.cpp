@@ -30,9 +30,12 @@ static void Case(const char* name) { g_case = name; std::printf("- %s\n", name);
 // ---------------------------------------------------------------- fakes
 struct FakeClock : Clock {
     unsigned long long now = 0;
+    Engine* stopOnWait = nullptr;
+    int waitsBeforeStop = 0;
     unsigned long long NowUs() override { return now; }
     bool WaitUntilUs(unsigned long long target, const std::atomic<bool>* cancel) override {
         if (target > now) now = target;
+        if (stopOnWait && --waitsBeforeStop == 0) stopOnWait->EmergencyStop();
         return !(cancel && cancel->load());
     }
 };
@@ -50,6 +53,8 @@ struct FakeSink : InputSink {
     std::vector<FakeEvent> events;
     std::vector<std::pair<int, int>> moves;
     unsigned long long* clock = nullptr;
+    bool emergency = false;
+    bool EmergencyStopRequested() override { return emergency; }
 
     void Send(const INPUT* in, int count) override {
         for (int i = 0; i < count; i++) {
@@ -592,6 +597,56 @@ static void TestRestartAfterStop() {
     CHECK_EQ(CountDowns(sink), 4);
 }
 
+static void TestEmergencyStop() {
+    Case("screen-edge emergency stop");
+    const int screens[][4] = {{0, 0, 1920, 1080}, {-1280, -100, 0, 924}};
+    for (const auto& r : screens) {
+        int x = (r[0] + r[2]) / 2, y = (r[1] + r[3]) / 2;
+        CHECK(IsScreenEdge(r[0], y, r[0], r[1], r[2], r[3]));
+        CHECK(IsScreenEdge(r[2] - 1, y, r[0], r[1], r[2], r[3]));
+        CHECK(IsScreenEdge(x, r[1], r[0], r[1], r[2], r[3]));
+        CHECK(IsScreenEdge(x, r[3] - 1, r[0], r[1], r[2], r[3]));
+        CHECK(IsScreenEdge(r[0] + kEmergencyEdgePx - 1, y, r[0], r[1], r[2], r[3]));
+        CHECK(!IsScreenEdge(r[0] + kEmergencyEdgePx, y, r[0], r[1], r[2], r[3]));
+        CHECK(!IsScreenEdge(x, y, r[0], r[1], r[2], r[3]));
+        CHECK(!IsScreenEdge(r[2], y, r[0], r[1], r[2], r[3]));
+    }
+    for (int mode : {MODE_REPEAT, MODE_HOLD, MODE_SINGLE}) {
+        FakeClock clock; FakeSink sink;
+        Engine e(clock, sink);
+        Config c = BaseConfig(); c.clickMode = mode; c.clickHoldUs = 0;
+        e.ApplyConfig(c); e.Start();
+        if (mode != MODE_SINGLE) e.Tick();
+        int downs = CountDowns(sink);
+        sink.emergency = true; e.Tick();
+        CHECK(!e.IsRunning());
+        CHECK(e.Status().emergencyStopped);
+        CHECK_EQ(CountDowns(sink), downs);
+        CHECK_EQ(CountUps(sink), downs);
+        e.Tick(); CHECK_EQ(CountDowns(sink), downs);
+        sink.emergency = false; e.Start();
+        CHECK(!e.Status().emergencyStopped);
+        e.Stop(); e.Tick();
+    }
+    {
+        FakeClock clock; FakeSink sink; Engine e(clock, sink);
+        Config c = BaseConfig(); c.startDelaySec = 30;
+        e.ApplyConfig(c); e.Start();
+        CHECK(e.EmergencyStop()); CHECK(!e.EmergencyStop());
+        e.Tick(); CHECK(!e.IsRunning()); CHECK(sink.events.empty());
+        CHECK(e.Status().emergencyStopped);
+    }
+    for (int wait : {1, 2}) {
+        FakeClock clock; FakeSink sink; Engine e(clock, sink);
+        Config c = BaseConfig(); c.clickType = CL_DOUBLE; c.clickHoldUs = 10000;
+        e.ApplyConfig(c); e.Start();
+        clock.stopOnWait = &e; clock.waitsBeforeStop = wait;
+        e.Tick(); e.Tick();
+        CHECK(!e.IsRunning()); CHECK(e.Status().emergencyStopped);
+        CHECK_EQ(CountDowns(sink), 1); CHECK_EQ(CountUps(sink), 1);
+    }
+}
+
 int main() {
     std::printf("Ultimate AutoClicker - test suite\n");
     std::printf("===============================\n");
@@ -615,6 +670,7 @@ int main() {
     TestMouseButtons();
     TestStopIsImmediate();
     TestRestartAfterStop();
+    TestEmergencyStop();
 
     std::printf("===============================\n");
     std::printf("%d checks, %d failures\n", g_checks, g_fails);
