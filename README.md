@@ -18,6 +18,13 @@ Download **[UltimateAutoClicker.exe](https://github.com/kuy124/UltimateAutoClick
 
 The app runs without administrator permissions. To automate an app running as administrator, launch AutoClicker using **Run as administrator** too; Windows blocks normal apps from sending input to elevated apps.
 
+### What's new in 1.2.4
+* **Reliable Windows hotkeys:** Start/Stop works with AutoClicker itself or another app focused, including while unrelated non-modifier keys are held. Holding the shortcut no longer repeatedly toggles clicking.
+* **Readable interval warnings:** the full two-line warning fits at sub-millisecond intervals, without overlapping nearby controls.
+* **Stable saved settings:** refreshing the Windows interface no longer overwrites restored values or leaves an old start countdown active.
+* **Optional Game timing:** Windows and Linux X11 can use a 50 ms press and release gap for games that poll input once per frame. Protected games can still reject automated input.
+* **Blocked-input feedback:** Windows input-delivery failures stop automation and explain the permissions requirement instead of silently continuing.
+
 ### What's new in 1.2.3
 * **Screen-edge emergency stop:** move the cursor to any monitor edge to stop automation, cancel countdowns, and release held buttons.
 * **Clear safety feedback:** a pulsing red border, click-through warning, and persistent stop status; restart manually when ready.
@@ -32,13 +39,13 @@ The app runs without administrator permissions. To automate an app running as ad
 
 ### Download and build for Linux (X11)
 
-Get Linux packages from [release 1.2.3](https://github.com/kuy124/UltimateAutoClicker/releases/tag/1.2.3).
+Get Linux packages from [release 1.2.4](https://github.com/kuy124/UltimateAutoClicker/releases/tag/1.2.4).
 These packages target **x86-64 Linux**, built on Ubuntu 24.04 (glibc 2.39); build from source on older distributions.
 Choose `.deb` for Debian/Ubuntu, `.rpm` for RPM-based distributions, or `.tar.gz`, `.tar.xz`, or `.zip` for manual installation.
 Archives require GTK 3, libX11, and libXtst installed separately. Verify downloads with the accompanying `SHA256SUMS-linux.txt`.
 
 ```sh
-sudo apt install ./UltimateAutoClicker-1.2.3-Linux-x86_64.deb
+sudo apt install ./UltimateAutoClicker-1.2.4-Linux-x86_64.deb
 # Or extract an archive and run ./bin/ultimate-autoclicker
 ```
 
@@ -141,14 +148,14 @@ Run `build.bat` or `test.bat` from the project root. Launch the app from `bin/Ul
 
 ### 5. Full High-DPI Scaling Support (Per-Monitor V2)
 * Coordinates remain accurate on displays scaled at **125%**, **150%**, **175%**, or **200%+**.
-* The main window keeps a compact 500-pixel content width, with 530-pixel Basic and 570-pixel Advanced content heights, including on scaled displays. Dialog controls and fonts scale with display DPI, and their sizes account for title bars and borders. The main window scrolls on shorter screens.
+* The main window keeps a compact 500-pixel content width, with 626-pixel Basic and 666-pixel Advanced content heights, including on scaled displays. Dialog controls and fonts scale with display DPI, and their sizes account for title bars and borders. The main window scrolls on shorter screens.
 
 ### 6. Smart Interval Auto-Conversion
 * Enter decimals or large numbers across **Hours**, **Minutes**, **Seconds**, **Milliseconds**, and **Microseconds ($\mu\text{s}$)** fields.
 * Pressing **Enter** inside any box immediately normalizes and distributes values across all unit fields.
 
 ### 7. True Multi-Key Global Hotkeys
-* A low level keyboard hook (`WH_KEYBOARD_LL`) matches the exact set of held keys, so `F6`, `Ctrl + Shift + Q` and combinations like `X + Z` all work while another application has the focus.
+* Single-key shortcuts such as `F6` and `Ctrl + Shift + Q` use native Windows global hotkeys (`RegisterHotKey`), including when AutoClicker itself has focus or is hidden behind another app. A low-level keyboard hook handles multi-key combinations such as `X + Z` and provides a fallback if native registration is unavailable. Unrelated held keys do not block the shortcut, and holding it does not repeatedly toggle Start/Stop. Modifier keys must still match the configured combination.
 
 ### 8. More Actions Than Clicks
 * **Action:** Click, Scroll Up, Scroll Down, or Type Text (types the text box one character per interval).
@@ -167,6 +174,13 @@ Run `build.bat` or `test.bat` from the project root. Launch the app from `bin/Ul
 * Move the cursor into the outer **5 pixels of any monitor** to stop automation immediately, including countdowns and held buttons. Restart manually with **Start** or your hotkey.
 * A pulsing red screen border and click-through warning confirm the stop without stealing focus. The app keeps the stop reason visible, and reduced-motion settings disable animation.
 * Programmed cursor moves do not trigger the stop. Linux X11 uses cursor-position polling; desktops without a compositor show a compact warning instead of the full-screen border.
+
+### Game compatibility
+Enable **Game timing** for games that poll button state once per frame. Click actions use at least a 50 ms press and a 50 ms release gap (at most 10 clicks/second); longer configured press durations still apply. Leave it off for normal high-speed clicking. On Windows the checkbox is available in both Basic and Advanced views; Linux exposes it in settings.
+
+Use the global hotkey after focusing the game. For mouse-look games, select **Current Location** instead of fixed coordinates. If the game runs as administrator, AutoClicker needs matching permissions. Windows input-delivery failures now stop automation and show an explanation rather than silently continuing.
+
+Compatibility is not universal: some games ignore synthetic input even when Windows accepts it. Anti-cheat restrictions, protected desktops, and native Wayland are not bypassed. Try windowed/borderless mode if exclusive fullscreen rejects input. Game timing helps frame-polled input; it does not make blocked input appear physical.
 
 ## How to Use
 
@@ -205,8 +219,8 @@ test.bat
 
 The suite has two parts:
 
-* **200 engine unit checks** (`tests.exe`) run the click engine on a virtual clock: interval maths, the interval clamp, randomised intervals, drift free scheduling, double clicks, hold mode, sequence playback with per point delays, scrolling, auto typing, the hotkey matcher and the config codec. They also cover screen-edge stops, cancellation between double clicks, and the regressions for the endless "repeat N" restart and the zero interval spin lock. The virtual clock keeps the results deterministic.
-* **541 GUI checks** (`guitest.exe --selftest`) drive the real window: Basic defaults, mode switching, Advanced tab navigation, visible control bounds, title, interval conversion, countdown cancellation, click count, settings round trip, profiles, modal dialogs, font scaling at 100%/150%/200%, button text fit, compact window size across DPI changes, small-screen scrolling, and click-through emergency feedback while minimized.
+* **205 engine unit checks** (`tests.exe`) run the click engine on a virtual clock: interval maths, the interval clamp, randomised intervals, drift free scheduling, double clicks, hold mode, sequence playback with per point delays, scrolling, auto typing, the hotkey matcher and the config codec. They also cover game timing, screen-edge stops, cancellation between double clicks, and the regressions for the endless "repeat N" restart and the zero interval spin lock. The virtual clock keeps the results deterministic.
+* **4,416 GUI checks** (`guitest.exe --selftest`) drive the real window: Basic defaults, mode switching, Advanced tab navigation, control bounds and warning text fit, title, interval conversion, countdown cancellation, click count, settings round trip, profiles, modal dialogs, font scaling at 100%/150%/200%, button text fit, compact window size across DPI changes, small-screen scrolling, and click-through emergency feedback while minimized. Hotkey regressions cover focused-window activation, key-repeat suppression, native dispatch without the keyboard hook, capture, settings restoration, and real clicks in a separate borderless-fullscreen process while movement keys are held.
 
 <hr>
 

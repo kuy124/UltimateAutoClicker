@@ -27,7 +27,7 @@ enum {
     ID_TOP_CHECK, ID_MAIN_BTN,
     ID_STAT_CLICKS,
     ID_PROF_COMBO, ID_PROF_SAVE, ID_PROF_LOAD, ID_PROF_DEL,
-    ID_UI_MODE, ID_UI_TABS, ID_SAFETY_STATUS,
+    ID_UI_MODE, ID_UI_TABS, ID_SAFETY_STATUS, ID_GAME_CHECK,
     ID_SEQ_LIST = 401, ID_SEQ_ADD_BTN, ID_SEQ_DEL_BTN, ID_SEQ_CLR_BTN,
     ID_SEQ_IN_X, ID_SEQ_IN_Y, ID_SEQ_IN_D, ID_SEQ_REC_BTN
 };
@@ -37,11 +37,13 @@ enum {
 #define WM_APP_REC    (WM_APP + 3)
 #define WM_APP_STATE  (WM_APP + 4)
 #define WM_APP_EMERGENCY (WM_APP + 5)
+#define WM_APP_TOGGLE (WM_APP + 6)
 
 #define IDI_APPICON 101
 
 // ---------------------------------------------------------------- globals
 static Config   g_cfg;
+static bool g_applyingConfig = false;
 static Engine*  g_engine = nullptr;
 static Clock*   g_clock = nullptr;
 static InputSink* g_sink = nullptr;
@@ -51,6 +53,7 @@ static HFONT g_font = nullptr, g_bold = nullptr;
 static HHOOK g_kbHook = nullptr, g_mouseHook = nullptr;
 static HHOOK g_emergencyMouseHook = nullptr;
 static HWND g_emergencyOverlay = nullptr;
+static std::atomic<bool> g_inputBlocked{false};
 static ULONGLONG g_emergencyEffectStart = 0;
 static BOOL g_emergencyAnimate = TRUE;
 static HANDLE hWake = nullptr, hInterrupt = nullptr;
@@ -58,7 +61,7 @@ static bool  g_running = true;
 static bool  g_periodActive = false;
 static bool  g_lastBusy = false;
 static bool  g_advanced = false;
-static int MainContentHeight() { return g_advanced ? 570 : 530; }
+static int MainContentHeight() { return g_advanced ? 666 : 626; }
 enum { UI_INTERVAL, UI_RANDOM, UI_CLICK, UI_ACTION, UI_REPEAT, UI_POSITION,
        UI_TIMING, UI_SHORTCUT, UI_PROFILES, UI_FOOTER };
 struct MainControl { HWND hwnd; int x, y, w, h, section; };
@@ -72,6 +75,8 @@ static HWND  g_seqDlg = nullptr;
 // hotkey tracking
 static std::vector<int> g_pressedKeys;
 static BYTE g_heldMods = 0;
+static bool g_hotkeyRegistered = false;
+constexpr int kStartStopHotkeyId = 1;
 static bool g_capturing = false;
 static std::vector<int> g_captureHeld;
 static BYTE g_captureHeldMods = 0;
@@ -82,6 +87,17 @@ static HWND  g_hotkeyDlg = nullptr;
 static std::vector<std::wstring> g_profiles;
 static std::map<std::wstring, std::wstring> g_profileData;
 static std::wstring g_iniPath;
+
+static void UpdateGlobalHotkey() {
+    UnregisterHotKey(g_mainWnd, kStartStopHotkeyId);
+    g_hotkeyRegistered = false;
+    g_pressedKeys.clear();
+    g_heldMods = 0;
+    if (!g_hotkeyDlgOpen && !g_seqDlgOpen && g_cfg.hotkey.keys.size() == 1) {
+        g_hotkeyRegistered = RegisterHotKey(g_mainWnd, kStartStopHotkeyId,
+            g_cfg.hotkey.mods | MOD_NOREPEAT, g_cfg.hotkey.keys[0]) != FALSE;
+    }
+}
 
 // ---------------------------------------------------------------- win32 clock / sink
 struct WinClock : Clock {
@@ -119,7 +135,13 @@ struct WinClock : Clock {
 };
 
 struct WinSink : InputSink {
-    void Send(const INPUT* in, int count) override { SendInput(count, (LPINPUT)in, sizeof(INPUT)); }
+    void Send(const INPUT* in, int count) override {
+        if (SendInput(count, (LPINPUT)in, sizeof(INPUT)) != (UINT)count) {
+            g_inputBlocked = true;
+            if (g_engine) g_engine->Stop();
+            if (hInterrupt) SetEvent(hInterrupt);
+        }
+    }
     void MoveCursor(int x, int y) override {
         INPUT in = {};
         in.type = INPUT_MOUSE;
@@ -420,9 +442,11 @@ static void ApplyUiToConfig() {
     if (g_cfg.startDelaySec > 300) g_cfg.startDelaySec = 300;
     g_cfg.clickHoldUs = (long long)GetDouble(g_mainWnd, ID_HOLD_EDIT) * 1000.0;
     g_cfg.alwaysOnTop = IsChecked(g_mainWnd, ID_TOP_CHECK);
+    g_cfg.gameCompatible = IsChecked(g_mainWnd, ID_GAME_CHECK);
 }
 
 static void ApplyConfigToUi() {
+    g_applyingConfig = true;
     double h, m, s, ms, us;
     UsToFields(g_cfg.intervalUs, h, m, s, ms, us);
     SetDlgItemTextW(g_mainWnd, ID_HRS, Fmt(L"%.0f", h).c_str());
@@ -454,10 +478,13 @@ static void ApplyConfigToUi() {
     SetInt(g_mainWnd, ID_DELAY_EDIT, g_cfg.startDelaySec);
     SetDlgItemTextW(g_mainWnd, ID_HOLD_EDIT, Fmt(L"%.0f", (double)g_cfg.clickHoldUs / 1000.0).c_str());
     SetChecked(g_mainWnd, ID_TOP_CHECK, g_cfg.alwaysOnTop);
+    SetChecked(g_mainWnd, ID_GAME_CHECK, g_cfg.gameCompatible);
 
     std::wstring hk = g_cfg.hotkey.empty() ? std::wstring(L"(none)") : g_cfg.hotkey.Name();
     SetText(GetDlgItem(g_mainWnd, ID_HOTKEY_LABEL), L"Hotkey: " + hk);
+    UpdateGlobalHotkey();
     SetWindowPos(g_mainWnd, g_cfg.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    g_applyingConfig = false;
 }
 
 static void UpdateEnabledStates() {
@@ -531,14 +558,6 @@ static bool VecHas(const std::vector<int>& v, int x) {
 static void VecDel(std::vector<int>& v, int x) {
     v.erase(std::remove(v.begin(), v.end(), x), v.end());
 }
-static bool OurWindowFocused() {
-    HWND fg = GetForegroundWindow();
-    if (!fg) return false;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(fg, &pid);
-    return pid == GetCurrentProcessId();
-}
-
 // ---------------------------------------------------------------- start / stop
 static void TimerResolutionOn() {
     if (g_periodActive) return;
@@ -689,6 +708,7 @@ static void ToggleClicking() {
                 L"Emergency stop unavailable", MB_OK | MB_ICONERROR);
             return;
         }
+        g_inputBlocked = false;
         if (g_emergencyOverlay) { KillTimer(g_emergencyOverlay, 1); ShowWindow(g_emergencyOverlay, SW_HIDE); }
         ApplyUiToConfig();
         g_engine->ApplyConfig(g_cfg);
@@ -717,7 +737,8 @@ static void UpdateStats() {
     wchar_t buf[64];
     swprintf_s(buf, 64, L"%d", st.clicksDone);
     SetText(GetDlgItem(g_mainWnd, ID_STAT_CLICKS), L"Clicks: " + std::wstring(buf));
-    SetText(GetDlgItem(g_mainWnd, ID_SAFETY_STATUS), st.emergencyStopped ?
+    SetText(GetDlgItem(g_mainWnd, ID_SAFETY_STATUS), g_inputBlocked.load() ?
+        L"Input blocked. Match the target app's administrator permissions. Some games reject automated input." : st.emergencyStopped ?
         L"EMERGENCY STOP - all clicks stopped. Restart manually." : g_emergencyMouseHook ?
         L"Emergency stop: move the cursor to any screen edge." : L"Screen-edge stop unavailable. Clicking is disabled.");
 
@@ -774,16 +795,14 @@ static int HandleKeyDown(KBDLLHOOKSTRUCT* k) {
         return 1;                                            // swallow while capturing
     }
 
+    if (g_hotkeyRegistered || g_hotkeyDlgOpen || g_seqDlgOpen) return 0;
     if (mod) { g_heldMods |= ModBit(vk); return 0; }
-    if (VecHas(g_pressedKeys, vk)) return 0;                 // auto repeat
-    g_pressedKeys.push_back(vk);
-
-    if (!g_hotkeyDlgOpen && !OurWindowFocused()) {
-        if (ComboMatches(g_cfg.hotkey, g_pressedKeys, g_heldMods)) {
-            g_pressedKeys.clear();
-            ToggleClicking();
-            return 1;                                        // swallow the trigger key
-        }
+    if (!VecHas(g_cfg.hotkey.keys, vk)) return 0;
+    bool repeat = VecHas(g_pressedKeys, vk);
+    if (!repeat) g_pressedKeys.push_back(vk);
+    if (ComboMatches(g_cfg.hotkey, g_pressedKeys, g_heldMods)) {
+        if (!repeat) PostMessageW(g_mainWnd, WM_APP_TOGGLE, 0, 0);
+        return 1;
     }
     return 0;
 }
@@ -823,9 +842,9 @@ static LRESULT CALLBACK KbHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     else PostMessage(g_mainWnd, WM_APP_STATE, 0, 0);   // cancel pick / recording
                     return 1;
                 }
-                HandleKeyDown(k);
+                if (HandleKeyDown(k)) return 1;
             } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-                HandleKeyUp(k);
+                if (HandleKeyUp(k)) return 1;
             }
         }
     }
@@ -892,6 +911,7 @@ static LRESULT CALLBACK HotkeyModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case WM_CREATE: {
             g_hotkeyDlg = hwnd;
             g_capturing = true;
+            UpdateGlobalHotkey();
             g_captureHeld.clear();
             g_captureHeldMods = 0;
             g_captureResult = Combo();
@@ -960,7 +980,7 @@ static LRESULT CALLBACK HotkeyModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ScaleUi(hwnd, HIWORD(wParam));
             SizeClient(hwnd, 420, 204);
             break;
-        case WM_DESTROY: FreeUiFonts(hwnd); break;
+        case WM_DESTROY: UpdateGlobalHotkey(); FreeUiFonts(hwnd); break;
         default: return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     return 0;
@@ -997,6 +1017,7 @@ static LRESULT CALLBACK SeqModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_CREATE: {
             g_seqDlg = hwnd;
             g_seqDlgOpen = true;
+            UpdateGlobalHotkey();
             HWND l0 = CreateWindowExW(0, L"STATIC", L"Click points (recorded or manual):",
                 WS_VISIBLE | WS_CHILD, 16, 16, 388, 22, hwnd, nullptr, nullptr, nullptr);
             SendMessage(l0, WM_SETFONT, (WPARAM)g_bold, TRUE);
@@ -1120,7 +1141,7 @@ static LRESULT CALLBACK SeqModalProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             SizeClient(hwnd, 420, 338);
             RefreshSeqList(GetDlgItem(hwnd, ID_SEQ_LIST));
             break;
-        case WM_DESTROY: FreeUiFonts(hwnd); break;
+        case WM_DESTROY: UpdateGlobalHotkey(); FreeUiFonts(hwnd); break;
         default: return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     return 0;
@@ -1153,10 +1174,10 @@ static void LayoutMain(HWND hwnd) {
     ShowWindow(tabs, g_advanced ? SW_SHOW : SW_HIDE);
     int page = TabCtrl_GetCurSel(tabs);
     const int originalTop[] = {8, 90, 144, 205, 266, 320, 431, 485, 539, 596};
-    const int basicTop[] = {52, -1, 164, -1, 260, -1, -1, 340, -1, 420};
-    const int clickingTop[] = {92, -1, 204, -1, 300, -1, -1, 380, -1, 460};
-    const int automationTop[] = {-1, 92, -1, 172, -1, 252, 388, -1, -1, 460};
-    const int profilesTop[] = {-1, -1, -1, -1, -1, -1, -1, -1, 92, 460};
+    const int basicTop[] = {52, -1, 180, -1, 276, -1, -1, 356, -1, 436};
+    const int clickingTop[] = {92, -1, 220, -1, 316, -1, -1, 396, -1, 476};
+    const int automationTop[] = {-1, 92, -1, 172, -1, 252, 388, -1, -1, 476};
+    const int profilesTop[] = {-1, -1, -1, -1, -1, -1, -1, -1, 92, 476};
     const int* top = !g_advanced ? basicTop : page == 1 ? automationTop : page == 2 ? profilesTop : clickingTop;
     for (const auto& c : g_mainControls) {
         int id = GetDlgCtrlID(c.hwnd);
@@ -1165,7 +1186,7 @@ static void LayoutMain(HWND hwnd) {
         int x = c.x, y = top[c.section] + c.y - originalTop[c.section], w = c.w, h = c.h;
         if (group) {
             x = 16; w = 468;
-            const int heights[] = {96, 64, 80, 64, 64, 120, 64, 64, 104};
+            const int heights[] = {112, 64, 80, 64, 64, 120, 64, 64, 104};
             h = heights[c.section];
         } else {
             x = std::max(28, x);
@@ -1177,7 +1198,7 @@ static void LayoutMain(HWND hwnd) {
                 if (id == fields[i]) { x = 28 + i * 90; y = top[UI_INTERVAL] + 42; w = 78; h = 26; }
             }
             if (!id) { x = 28 + ((c.x - 18 + 35) / 69) * 90; y = top[UI_INTERVAL] + 22; w = 78; }
-            if (id == ID_WARN_STATIC) { x = 28; y = top[UI_INTERVAL] + 72; w = 438; h = 20; }
+            if (id == ID_WARN_STATIC) { x = 28; y = top[UI_INTERVAL] + 72; w = 438; h = 36; }
         }
         if (c.section == UI_CLICK && !group) {
             int column = c.x < 190 ? 0 : c.x < 320 ? 1 : 2;
@@ -1192,9 +1213,24 @@ static void LayoutMain(HWND hwnd) {
             if (id == ID_PROF_COMBO) { x = 28; y = top[UI_PROFILES] + 24; w = 438; }
             else { x = 28 + (id - ID_PROF_SAVE) * 150; y = top[UI_PROFILES] + 60; w = 138; }
         }
-        if (id == ID_TOP_CHECK) { x = 320; y = top[UI_FOOTER] + 8; w = 158; }
-        if (id == ID_SAFETY_STATUS) { x = 22; y = top[UI_FOOTER] + 24; w = 456; h = 18; }
-        if (id == ID_MAIN_BTN) { x = 16; y = top[UI_FOOTER] + 42; w = 468; h = 48; }
+        if (c.section == UI_ACTION && !group) {
+            if (id == ID_ACTION_COMBO) { x = 90; w = 132; }
+            else if (id == ID_TEXT_EDIT) { x = 282; w = 184; }
+            else { x = c.x < 100 ? 28 : 238; w = 40; }
+        }
+        if (c.section == UI_TIMING && !group) {
+            if (id == ID_DELAY_EDIT) { x = 112; w = 46; }
+            else if (id == ID_HOLD_EDIT) { x = 266; w = 54; }
+            else if (c.x < 100) { x = 28; w = 78; }
+            else if (c.x < 170) { x = 164; w = 28; }
+            else if (c.x < 230) { x = 218; w = 42; }
+            else if (c.x < 290) { x = 326; w = 26; }
+            else { x = 358; w = 108; SetWindowTextW(c.hwnd, L"press duration"); }
+        }
+        if (id == ID_TOP_CHECK) { x = 320; y = top[UI_FOOTER] + 4; w = 158; }
+        if (id == ID_GAME_CHECK) { x = 22; y = top[UI_FOOTER] + 34; w = 456; h = 24; }
+        if (id == ID_SAFETY_STATUS) { x = 22; y = top[UI_FOOTER] + 70; w = 456; h = 40; }
+        if (id == ID_MAIN_BTN) { x = 16; y = top[UI_FOOTER] + 122; w = 468; h = 48; }
         SetWindowPos(c.hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         ShowWindow(c.hwnd, visible ? SW_SHOW : SW_HIDE);
     }
@@ -1327,6 +1363,7 @@ static void BuildUi(HWND hwnd) {
     // --- status
     section = UI_FOOTER;
     Add(L"STATIC", L"Clicks: 0", 0, 22, 596, 170, 20, ID_STAT_CLICKS);
+    Add(L"BUTTON", L"Game timing: 50 ms press / release (max 10 CPS)", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 624, 456, 24, ID_GAME_CHECK);
     Add(L"STATIC", L"Emergency stop: move the cursor to any screen edge.", 0, 22, 612, 456, 18, ID_SAFETY_STATUS);
     Add(L"BUTTON", L"Always on Top", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 620, 180, 20, ID_TOP_CHECK);
     Add(L"BUTTON", L"START CLICKING (F6)", BS_PUSHBUTTON | WS_TABSTOP, 10, 650, 540, 36, ID_MAIN_BTN, g_bold);
@@ -1360,6 +1397,13 @@ static void RefreshProfileCombo() {
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_HOTKEY:
+            if (wParam != kStartStopHotkeyId || !g_hotkeyRegistered ||
+                HIWORD(lParam) != g_cfg.hotkey.keys[0] || LOWORD(lParam) != g_cfg.hotkey.mods) break;
+            [[fallthrough]];
+        case WM_APP_TOGGLE:
+            if (!g_hotkeyDlgOpen && !g_seqDlgOpen && !g_capturing) ToggleClicking();
+            break;
         case WM_NOTIFY: {
             NMHDR* notification = (NMHDR*)lParam;
             if (notification->idFrom == ID_UI_TABS && notification->code == TCN_SELCHANGE) {
@@ -1472,6 +1516,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         }
         case WM_COMMAND: {
+            if (g_applyingConfig) break;
             int id = LOWORD(wParam);
             if (HIWORD(wParam) == EN_SETFOCUS || HIWORD(wParam) == CBN_SETFOCUS ||
                 HIWORD(wParam) == BN_SETFOCUS) {
@@ -1500,6 +1545,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                     break;
                 case ID_MAIN_BTN: ToggleClicking(); break;
+                case ID_GAME_CHECK: ApplyUiToConfig(); SaveIni(); break;
                 case ID_PICK_BTN: {
                     g_pickMode = 1;
                     ShowWindow(hwnd, SW_HIDE);
@@ -1619,6 +1665,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_emergencyMouseHook) { UnhookWindowsHookEx(g_emergencyMouseHook); g_emergencyMouseHook = nullptr; }
             TrayRemove();
             if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
+            UnregisterHotKey(hwnd, kStartStopHotkeyId);
             if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
             SaveIni();
             PostQuitMessage(0);
@@ -1704,6 +1751,250 @@ static void CheckDialogScaling(HWND dialog, int width, int height) {
     ScaleUi(dialog, original);
 }
 
+static void CheckIntervalWarning(HWND hwnd) {
+    HWND label = GetDlgItem(hwnd, ID_WARN_STATIC);
+    if (!IsWindowVisible(label)) return;
+    Config saved = g_cfg;
+    g_cfg.intervalUs = 100;
+    g_cfg.randMinUs = 100;
+    g_cfg.randMaxUs = kMaxIntervalUs;
+    for (bool random : {false, true}) {
+        g_cfg.randomize = random;
+        UpdateWarning();
+        std::wstring text = GetText(hwnd, ID_WARN_STATIC);
+        ST_CHECK(text.find(L"\nBelow 5 ms") != std::wstring::npos, "fast intervals show the lag warning");
+        HDC dc = GetDC(label);
+        HGDIOBJ font = SelectObject(dc, (HFONT)SendMessage(label, WM_GETFONT, 0, 0));
+        RECT available; GetClientRect(label, &available);
+        RECT needed = available;
+        DrawTextW(dc, text.c_str(), -1, &needed, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        ST_CHECK(needed.bottom <= available.bottom, "the complete interval warning fits without clipping");
+        SelectObject(dc, font); ReleaseDC(label, dc);
+    }
+    RECT warning; GetWindowRect(label, &warning);
+    for (const auto& control : g_mainControls) {
+        if (control.section != UI_INTERVAL || control.y != 8) continue;
+        RECT group; GetWindowRect(control.hwnd, &group);
+        ST_CHECK(warning.bottom <= group.bottom - 4, "the warning stays inside the interval group");
+    }
+    g_cfg = saved;
+    UpdateWarning();
+}
+
+static void CheckLayoutSpacing(HWND hwnd) {
+    CheckIntervalWarning(hwnd);
+    std::vector<HWND> controls;
+    for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        if (!IsWindowVisible(child)) continue;
+        wchar_t cls[32]; GetClassNameW(child, cls, 32);
+        if (wcscmp(cls, WC_TABCONTROLW) == 0) continue;
+        if (wcscmp(cls, L"Button") == 0 && (GetWindowLongPtr(child, GWL_STYLE) & BS_TYPEMASK) == BS_GROUPBOX) continue;
+        controls.push_back(child);
+    }
+    for (size_t i = 0; i < controls.size(); ++i) {
+        RECT a; GetWindowRect(controls[i], &a);
+        for (size_t j = i + 1; j < controls.size(); ++j) {
+            RECT b, overlap; GetWindowRect(controls[j], &b);
+            bool collides = IntersectRect(&overlap, &a, &b);
+            if (collides) SelfTestLog("  overlap: ids %d / %d\n", GetDlgCtrlID(controls[i]), GetDlgCtrlID(controls[j]));
+            ST_CHECK(!collides, "visible controls do not overlap");
+        }
+    }
+    RECT safety, button;
+    GetWindowRect(GetDlgItem(hwnd, ID_SAFETY_STATUS), &safety);
+    GetWindowRect(GetDlgItem(hwnd, ID_MAIN_BTN), &button);
+    ST_CHECK(button.top - safety.bottom >= 8, "safety text has breathing room above Start");
+    HWND label = GetDlgItem(hwnd, ID_SAFETY_STATUS);
+    HDC dc = GetDC(label);
+    HGDIOBJ font = SelectObject(dc, (HFONT)SendMessage(label, WM_GETFONT, 0, 0));
+    RECT available; GetClientRect(label, &available);
+    RECT needed = available;
+    std::wstring longest = L"Input blocked. Match the target app's administrator permissions. Some games reject automated input.";
+    DrawTextW(dc, longest.c_str(), -1, &needed, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    ST_CHECK(needed.bottom <= available.bottom, "blocked-input explanation fits without clipping");
+    SelectObject(dc, font); ReleaseDC(label, dc);
+    CheckCaptionFits(hwnd, ID_GAME_CHECK);
+}
+
+static void SendTestKey(WORD key, bool up = false) {
+    INPUT input = {};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = key;
+    input.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+    ST_CHECK(SendInput(1, &input, sizeof(input)) == 1, "test key reaches Windows");
+}
+
+static bool FocusTestWindow(HWND hwnd) {
+    DWORD foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    DWORD thread = GetCurrentThreadId();
+    bool attached = foregroundThread != thread && AttachThreadInput(thread, foregroundThread, TRUE);
+    SetForegroundWindow(hwnd);
+    if (attached) AttachThreadInput(thread, foregroundThread, FALSE);
+    PumpMessages(80);
+    return GetForegroundWindow() == hwnd;
+}
+
+static void CheckFocusedHotkey(HWND hwnd) {
+    Config saved = g_cfg;
+    g_cfg.action = ACT_TYPE;
+    g_cfg.typeText.clear();
+    g_cfg.startDelaySec = 30;
+    g_cfg.maxClicks = 0;
+    Config intended = g_cfg;
+    ApplyConfigToUi();
+    ST_CHECK(EncodeConfig(g_cfg) == EncodeConfig(intended), "refreshing the UI does not overwrite restored settings");
+    ST_CHECK(GetInt(hwnd, ID_DELAY_EDIT) == 30, "the restored countdown reaches its control");
+    g_engine->ApplyConfig(g_cfg);
+    ST_CHECK(FocusTestWindow(hwnd), "AutoClicker has focus for its own hotkey test");
+    SendTestKey(VK_F6);
+    PumpMessages(80);
+    ST_CHECK(g_engine->Status().state == ST_COUNTDOWN, "F6 starts from AutoClicker's own window");
+    SendTestKey(VK_F6);
+    PumpMessages(80);
+    ST_CHECK(g_engine->Status().state == ST_COUNTDOWN, "holding F6 does not repeatedly toggle");
+    SendTestKey(VK_F6, true);
+    PumpMessages(20);
+    SendTestKey(VK_F6);
+    SendTestKey(VK_F6, true);
+    PumpMessages(80);
+    ST_CHECK(!g_engine->IsRunning(), "a fresh F6 press cancels the countdown");
+    g_engine->Stop(); SetEvent(hInterrupt);
+    PumpMessages(40);
+    if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
+    g_kbHook = nullptr;
+    SendTestKey(VK_F6);
+    SendTestKey(VK_F6, true);
+    PumpMessages(80);
+    ST_CHECK(g_engine->Status().state == ST_COUNTDOWN, "the native hotkey works without the keyboard hook");
+    SendTestKey(VK_F6);
+    SendTestKey(VK_F6, true);
+    PumpMessages(80);
+    ST_CHECK(!g_engine->IsRunning(), "the native hotkey can stop without the keyboard hook");
+    g_engine->Stop(); SetEvent(hInterrupt);
+    PumpMessages(40);
+    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbHookProc, GetModuleHandleW(nullptr), 0);
+    ST_CHECK(g_kbHook != nullptr, "the keyboard hook is restored for multi-key shortcuts");
+    g_cfg = saved;
+    ApplyConfigToUi();
+    g_engine->ApplyConfig(g_cfg);
+}
+
+static LRESULT CALLBACK InputTestProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static int downs = 0, ups = 0;
+    if (msg == WM_LBUTTONDOWN) { ++downs; return 0; }
+    if (msg == WM_LBUTTONUP) { ++ups; return 0; }
+    if (msg == WM_APP + 100) {
+        if (lParam) { downs = ups = 0; return 0; }
+        return wParam ? ups : downs;
+    }
+    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static int RunInputTestTarget(HINSTANCE instance) {
+    WNDCLASSW wc = {};
+    wc.hInstance = instance;
+    wc.lpfnWndProc = InputTestProc;
+    wc.lpszClassName = L"AutoClickerInputTest";
+    wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
+    if (!RegisterClassW(&wc)) return 1;
+    MONITORINFO monitor = {sizeof(monitor)};
+    if (!GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &monitor)) return 1;
+    RECT r = monitor.rcMonitor;
+    std::wstring title = Fmt(L"AutoClicker input target %lu", GetCurrentProcessId());
+    HWND target = CreateWindowExW(0, wc.lpszClassName, title.c_str(), WS_POPUP | WS_VISIBLE,
+        r.left, r.top, r.right - r.left, r.bottom - r.top, nullptr, nullptr, instance, nullptr);
+    if (!target) return 1;
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return 0;
+}
+
+static void CheckFullscreenClicking(HWND hwnd) {
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring command = L"\"" + std::wstring(exe) + L"\" --input-test-target";
+    STARTUPINFOW startup = {sizeof(startup)};
+    PROCESS_INFORMATION process = {};
+    bool created = CreateProcessW(exe, &command[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process);
+    ST_CHECK(created, "a separate fullscreen input target starts");
+    if (!created) return;
+    std::wstring title = Fmt(L"AutoClicker input target %lu", process.dwProcessId);
+    HWND target = nullptr;
+    for (int i = 0; !target && i < 50; ++i) {
+        PumpMessages(40);
+        target = FindWindowW(L"AutoClickerInputTest", title.c_str());
+    }
+    ST_CHECK(target != nullptr, "the fullscreen target window exists");
+    Config saved = g_cfg;
+    if (target) {
+        g_cfg.action = ACT_CLICK;
+        g_cfg.clickMode = MODE_REPEAT;
+        g_cfg.clickType = CL_SINGLE;
+        g_cfg.mouseBtn = BTN_LEFT;
+        g_cfg.posMode = POS_CURRENT;
+        g_cfg.intervalUs = 100000;
+        g_cfg.randomize = false;
+        g_cfg.clickHoldUs = 0;
+        g_cfg.gameCompatible = true;
+        g_cfg.startDelaySec = 0;
+        g_cfg.maxClicks = 3;
+        RECT bounds; GetWindowRect(target, &bounds);
+        MONITORINFO monitor = {sizeof(monitor)};
+        GetMonitorInfoW(MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST), &monitor);
+        ST_CHECK(EqualRect(&bounds, &monitor.rcMonitor), "the input target fills its monitor");
+        POINT original; GetCursorPos(&original);
+        POINT center = {(bounds.left + bounds.right) / 2, (bounds.top + bounds.bottom) / 2};
+        for (bool multi : {false, true}) {
+            g_cfg.hotkey.keys = multi ? std::vector<int>{VK_F6, VK_F7} : std::vector<int>{VK_F6};
+            Config intended = g_cfg;
+            ApplyConfigToUi();
+            ST_CHECK(EncodeConfig(g_cfg) == EncodeConfig(intended), "fullscreen settings survive the UI refresh");
+            ST_CHECK(GetInt(hwnd, ID_DELAY_EDIT) == 0, "fullscreen clicking has no leftover countdown");
+            SendMessageW(target, WM_APP + 100, 0, 1);
+            g_sink->MoveCursor(center.x, center.y);
+            ShowWindow(hwnd, SW_HIDE);
+            bool focused = FocusTestWindow(target) && WindowFromPoint(center) == target;
+            ST_CHECK(focused, "the fullscreen target owns focus and the cursor");
+            if (focused) {
+                SendTestKey('W');
+                SendTestKey(VK_F6);
+                if (multi) SendTestKey(VK_F7);
+                SendTestKey(multi ? VK_F7 : VK_F6);
+                SendTestKey(VK_F6, true);
+                if (multi) SendTestKey(VK_F7, true);
+                PumpMessages(600);
+                SelfTestLog("  fullscreen %s: state=%d clicks=%d blocked=%d native=%d presses=%lld releases=%lld\n",
+                    multi ? "chord" : "F6", g_engine->Status().state, g_engine->Status().clicksDone,
+                    (int)g_inputBlocked.load(), (int)g_hotkeyRegistered,
+                    (long long)SendMessageW(target, WM_APP + 100, 0, 0),
+                    (long long)SendMessageW(target, WM_APP + 100, 1, 0));
+                ST_CHECK(!g_engine->IsRunning() && g_engine->Status().clicksDone == 3,
+                    "shortcuts work with a movement key held while AutoClicker is hidden");
+                ST_CHECK(SendMessageW(target, WM_APP + 100, 0, 0) == 3, "the other fullscreen process receives three presses");
+                ST_CHECK(SendMessageW(target, WM_APP + 100, 1, 0) == 3, "the other fullscreen process receives three releases");
+                SendTestKey('W', true);
+            }
+            g_engine->Stop(); SetEvent(hInterrupt);
+            PumpMessages(40);
+        }
+        g_sink->MoveCursor(original.x, original.y);
+        PostMessageW(target, WM_CLOSE, 0, 0);
+    }
+    DWORD result = WaitForSingleObject(process.hProcess, 2000);
+    ST_CHECK(result == WAIT_OBJECT_0, "the fullscreen test target closes");
+    if (result != WAIT_OBJECT_0) TerminateProcess(process.hProcess, 1);
+    CloseHandle(process.hThread); CloseHandle(process.hProcess);
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    g_cfg = saved;
+    ApplyConfigToUi();
+    g_engine->ApplyConfig(g_cfg);
+    UpdateWarning(); UpdateButton();
+}
+
 static int RunSelfTest(HWND hwnd) {
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         FILE* f = nullptr;
@@ -1713,7 +2004,25 @@ static int RunSelfTest(HWND hwnd) {
     SelfTestLog("Ultimate AutoClicker - GUI self test\n");
     SelfTestLog("===============================\n");
 
+    SelfTestLog("- focused hotkey and background fullscreen input\n");
+    CheckFocusedHotkey(hwnd);
+    CheckFullscreenClicking(hwnd);
+
     SelfTestLog("- interface modes\n");
+    CheckLayoutSpacing(hwnd);
+    for (UINT dpi : {96u, 144u, 192u}) {
+        RECT window; GetWindowRect(hwnd, &window);
+        SendMessage(hwnd, WM_DPICHANGED, MAKEWPARAM(dpi, dpi), (LPARAM)&window);
+        CheckLayoutSpacing(hwnd);
+    }
+    SetChecked(hwnd, ID_GAME_CHECK, true);
+    ApplyUiToConfig();
+    ST_CHECK(g_cfg.gameCompatible, "game timing checkbox updates the engine config");
+    SetChecked(hwnd, ID_GAME_CHECK, false);
+    ApplyUiToConfig();
+    g_inputBlocked = true; UpdateStats();
+    ST_CHECK(GetText(hwnd, ID_SAFETY_STATUS).find(L"Input blocked") == 0, "blocked input has a visible explanation");
+    g_inputBlocked = false; UpdateStats();
     ST_CHECK(!g_advanced && SendDlgItemMessage(hwnd, ID_UI_MODE, CB_GETCURSEL, 0, 0) == 0,
              "each launch defaults to Basic");
     ST_CHECK(!IsWindowVisible(GetDlgItem(hwnd, ID_RAND_CHECK)) &&
@@ -1728,6 +2037,7 @@ static int RunSelfTest(HWND hwnd) {
         SendMessage(hwnd, WM_COMMAND, MAKEWPARAM(ID_UI_MODE, CBN_SELCHANGE),
                     (LPARAM)GetDlgItem(hwnd, ID_UI_MODE));
         ST_CHECK(g_advanced == (mode == 1), "mode selector changes interface");
+        CheckLayoutSpacing(hwnd);
         ST_CHECK(!IsWindowVisible(GetDlgItem(hwnd, ID_ACTION_COMBO)) &&
                  !IsWindowVisible(GetDlgItem(hwnd, ID_POS_CUR)) &&
                  IsWindowVisible(GetDlgItem(hwnd, ID_MODE_COMBO)) == (mode == 1),
@@ -1767,6 +2077,7 @@ static int RunSelfTest(HWND hwnd) {
                  IsWindowVisible(GetDlgItem(hwnd, ID_PROF_COMBO)) == (page == 2) &&
                  IsWindowVisible(GetDlgItem(hwnd, ID_MS)) == (page == 0), "tabs show only their own settings");
         ST_CHECK(IsWindowVisible(GetDlgItem(hwnd, ID_MAIN_BTN)), "Start remains visible on every tab");
+        CheckLayoutSpacing(hwnd);
         for (const auto& control : g_mainControls) {
             if (!IsWindowVisible(control.hwnd)) continue;
             RECT bounds;
@@ -1971,6 +2282,11 @@ static int RunSelfTest(HWND hwnd) {
         SendMessage(hwnd, WM_COMMAND, (WPARAM)ID_CHANGE_HOTKEY_BTN, 0);
         HWND hk = FindWindowW(L"HotkeyModalClass", nullptr);
         ST_CHECK(hk != nullptr, "the hotkey dialog opens");
+        if (hk) {
+            KBDLLHOOKSTRUCT key = {}; key.vkCode = VK_F7;
+            ST_CHECK(KbHookProc(HC_ACTION, WM_KEYDOWN, (LPARAM)&key) == 1, "hotkey capture swallows key presses");
+            ST_CHECK(KbHookProc(HC_ACTION, WM_KEYUP, (LPARAM)&key) == 1, "hotkey capture swallows key releases");
+        }
         if (hk) { CheckControlBounds(hk); CheckDialogScaling(hk, 420, 204); }
         if (hk) { PostMessage(hk, WM_CLOSE, 0, 0); PumpMessages(200); }
         ST_CHECK(FindWindowW(L"HotkeyModalClass", nullptr) == nullptr, "the hotkey dialog closes");
@@ -2013,6 +2329,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             if (q) q();
         }
     }
+
+    if (wcsstr(GetCommandLineW(), L"--input-test-target")) return RunInputTestTarget(hInstance);
 
     hWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     hInterrupt = CreateEventW(nullptr, FALSE, FALSE, nullptr);

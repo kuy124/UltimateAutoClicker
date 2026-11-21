@@ -157,6 +157,7 @@ std::wstring EncodeConfig(const Config& c) {
     add(L"target_y", c.targetY);
     add(L"max_clicks", c.maxClicks);
     add(L"hold_us", c.clickHoldUs);
+    add(L"game_compatible", c.gameCompatible ? 1 : 0);
     add(L"start_delay", c.startDelaySec);
     s += L"type_text=" + Esc(c.typeText) + L";";
     s += L"hotkey=" + Esc(c.hotkey.Encode()) + L";";
@@ -199,6 +200,7 @@ bool DecodeConfig(const std::wstring& s, Config& out) {
     c.targetY    = (int)num(L"target_y", 0);
     c.maxClicks  = (int)num(L"max_clicks", 0);
     c.clickHoldUs = num(L"hold_us", 0);
+    c.gameCompatible = num(L"game_compatible", 0) != 0;
     c.startDelaySec = (int)num(L"start_delay", 3);
     auto it = kv.find(L"type_text"); if (it != kv.end()) c.typeText = Unesc(it->second);
     it = kv.find(L"hotkey");       if (it != kv.end()) c.hotkey.Decode(Unesc(it->second));
@@ -546,6 +548,7 @@ void Engine::DoClick(const Config& c, int x, int y, bool usePos) {
 
     long long holdUs = c.clickHoldUs > 0 ? c.clickHoldUs
                     : (c.intervalUs <= 1000 ? 0 : std::min<long long>(10000, c.intervalUs / 4));
+    if (c.gameCompatible) holdUs = std::max(50000LL, holdUs);
 
     if (holdUs <= 0) {
         sink_.Send(inputs, 2);
@@ -562,6 +565,8 @@ void Engine::DoClick(const Config& c, int x, int y, bool usePos) {
         clock_.WaitUntilUs(clock_.NowUs() + (unsigned long long)holdUs, &stopRequested_);
         sink_.Send(&inputs[1], 1);
     }
+    if (c.gameCompatible && !ShouldStop())
+        clock_.WaitUntilUs(clock_.NowUs() + 50000ULL, &stopRequested_);
 }
 
 void Engine::DoScroll(const Config& c) {

@@ -647,6 +647,21 @@ static void TestEmergencyStop() {
     }
 }
 
+static void TestGameTiming() {
+    Case("game timing preserves press and release across frames");
+    FakeClock clock; FakeSink sink; sink.clock = &clock.now;
+    Engine e(clock, sink);
+    Config c;
+    CHECK(DecodeConfig(L"game_compatible=1;interval_us=100;start_delay=0;max_clicks=3;", c));
+    CHECK(EncodeConfig(c).find(L"game_compatible=1") != std::wstring::npos);
+    e.ApplyConfig(c); e.Start(); RunUntilIdle(e);
+    CHECK_EQ(sink.events.size(), 6);
+    if (sink.events.size() == 6) {
+        CHECK(sink.events[1].t - sink.events[0].t >= 50000);
+        CHECK(sink.events[2].t - sink.events[1].t >= 50000);
+    }
+}
+
 int main() {
     std::printf("Ultimate AutoClicker - test suite\n");
     std::printf("===============================\n");
@@ -671,6 +686,7 @@ int main() {
     TestStopIsImmediate();
     TestRestartAfterStop();
     TestEmergencyStop();
+    TestGameTiming();
 
     std::printf("===============================\n");
     std::printf("%d checks, %d failures\n", g_checks, g_fails);

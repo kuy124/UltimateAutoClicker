@@ -88,7 +88,7 @@ struct App {
     XInput sink;
     Engine engine;
     GtkWidget *window, *interval, *button, *kind, *mode, *action, *limit, *delay,
-        *fixed, *x, *y, *random, *minimum, *maximum, *hold, *top, *start, *status, *safety;
+        *fixed, *x, *y, *random, *minimum, *maximum, *hold, *top, *start, *status, *safety, *game;
     GtkWidget* emergencyOverlay = nullptr;
     guint effectTimer = 0;
     gint64 effectStarted = 0;
@@ -216,6 +216,7 @@ struct App {
         c.randMaxUs = gtk_spin_button_get_value(GTK_SPIN_BUTTON(maximum));
         c.clickHoldUs = gtk_spin_button_get_value(GTK_SPIN_BUTTON(hold));
         c.alwaysOnTop = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(top));
+        c.gameCompatible = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(game));
         return c;
     }
     void Toggle() {
@@ -261,7 +262,7 @@ struct App {
             }
         }
         window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-        gtk_window_set_title(GTK_WINDOW(window), "Ultimate AutoClicker 1.2.3 — Linux X11");
+        gtk_window_set_title(GTK_WINDOW(window), "Ultimate AutoClicker 1.2.4 — Linux X11");
         gtk_window_set_default_size(GTK_WINDOW(window), 460, 620);
         gtk_container_set_border_width(GTK_CONTAINER(window), 16);
         auto* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
@@ -319,6 +320,7 @@ struct App {
         minimum = spin("Minimum interval (µs)", c.randMinUs, kMinIntervalUs, kMaxIntervalUs);
         maximum = spin("Maximum interval (µs)", c.randMaxUs, kMinIntervalUs, kMaxIntervalUs);
         top = check("Always on top", c.alwaysOnTop);
+        game = check("Game timing (50 ms press / release)", c.gameCompatible);
         gtk_window_set_keep_above(GTK_WINDOW(window), c.alwaysOnTop);
         g_signal_connect(top, "toggled", G_CALLBACK(+[](GtkToggleButton* toggle, gpointer data) {
             auto& a = *static_cast<App*>(data);
@@ -467,7 +469,7 @@ static int SelfTest(App& app) {
 
 int main(int argc, char** argv) {
     bool selftest = argc == 2 && std::strcmp(argv[1], "--selftest") == 0;
-    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) { std::puts("Ultimate AutoClicker 1.2.3 (Linux X11)"); return 0; }
+    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) { std::puts("Ultimate AutoClicker 1.2.4 (Linux X11)"); return 0; }
     if (!selftest && g_strcmp0(g_getenv("XDG_SESSION_TYPE"), "wayland") == 0) {
         std::fputs("Native Wayland automation is unsupported. Log into an X11/Xorg session.\n", stderr); return 1;
     }

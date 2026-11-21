@@ -76,6 +76,7 @@ struct Config {
     std::vector<SeqPoint> seq;
     Combo     hotkey;
     bool      alwaysOnTop = false;
+    bool      gameCompatible = false;
 };
 
 // Interval helpers (pure).
